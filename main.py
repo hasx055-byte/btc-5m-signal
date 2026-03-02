@@ -22,12 +22,17 @@ EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 VOL_SPIKE = float(os.getenv("VOL_SPIKE", "1.8"))               # أقوى
 
+# Retest settings (NEW)
+RETEST_ENABLED = os.getenv("RETEST_ENABLED", "1").strip()  # 1=on, 0=off
+RETEST_WAIT_SEC = int(os.getenv("RETEST_WAIT_SEC", "60"))  # كم ننتظر قبل "ENTER NOW"
+RETEST_TOL_PCT = float(os.getenv("RETEST_TOL_PCT", "0.05")) # سماحية الرجوع ضد الاتجاه (%)
+
 # optional: force provider (BITSTAMP / COINBASE / KRAKEN / AUTO)
 DATA_SOURCE = os.getenv("DATA_SOURCE", "AUTO").strip().upper()
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "poly-decision-bot/2.1",
+    "User-Agent": "poly-decision-bot/2.2",
     "Accept": "application/json"
 })
 
@@ -79,7 +84,6 @@ def rsi(closes, period=14):
 # returns closes(list), vols(list), last_close(float)
 # =============================
 def fetch_bitstamp(limit=250):
-    # step=60 seconds, limit up to 1000
     url = "https://www.bitstamp.net/api/v2/ohlc/btcusd/"
     params = {"step": 60, "limit": limit}
     r = session.get(url, params=params, timeout=12)
@@ -90,7 +94,6 @@ def fetch_bitstamp(limit=250):
     return closes, vols, closes[-1]
 
 def fetch_coinbase(limit=250):
-    # Coinbase Exchange public (newest->oldest)
     url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
     params = {"granularity": 60}
     r = session.get(url, params=params, timeout=12)
@@ -205,7 +208,9 @@ def decision_signal(closes, vols):
         "rsi": r,
         "vol_ratio": vol_ratio,
         "break_up": break_up,
-        "break_down": break_down
+        "break_down": break_down,
+        "recent_high": recent_high,
+        "recent_low": recent_low
     }
 
     if buy_ok:
@@ -215,6 +220,28 @@ def decision_signal(closes, vols):
     return None, info
 
 # =============================
+# RETEST LOGIC
+# =============================
+def retest_ok(direction: str, entry_price: float, current_price: float) -> bool:
+    """
+    هدفها تمنع الدخول المبكر:
+    - BUY: نسمح بدخول آمن إذا السعر ما رجع ضدنا أكثر من RETEST_TOL_PCT
+           و/أو بدأ يكمل فوق entry_price
+    - SELL: نفس الشي بالعكس
+    """
+    tol = RETEST_TOL_PCT / 100.0
+    if direction == "BUY":
+        # لو رجع ضدك كثير (نزل أكثر من tol) -> فخ
+        if current_price < entry_price * (1 - tol):
+            return False
+        # دخول آمن: السعر على الأقل رجع يثبت قريب/فوق entry
+        return current_price >= entry_price * (1 - tol/2)
+    else:  # SELL
+        if current_price > entry_price * (1 + tol):
+            return False
+        return current_price <= entry_price * (1 + tol/2)
+
+# =============================
 # MAIN LOOP
 # =============================
 def main():
@@ -222,14 +249,19 @@ def main():
         print("Missing BOT_TOKEN or CHAT_ID")
         return
 
-    tg_send("🟣 Poly Decision Bot started ✅ (AUTO providers)")
+    tg_send("🟣 Poly Decision Bot started ✅ (AUTO providers + Retest)")
 
     last_signal_time = 0
     signals_today = 0
     current_day = datetime.now(timezone.utc).date()
 
+    # Retest state
+    pending = None
+    # pending = {"dir": "BUY/SELL", "entry": price, "ts": time.time(), "info": info}
+
     while True:
         try:
+            # reset daily counter
             today = datetime.now(timezone.utc).date()
             if today != current_day:
                 current_day = today
@@ -240,7 +272,33 @@ def main():
                 time.sleep(20)
                 continue
 
+            # 1) إذا عندنا صفقة معلقة (Waiting Retest) نقيّمها
+            if pending and RETEST_ENABLED == "1":
+                if time.time() - pending["ts"] >= RETEST_WAIT_SEC:
+                    cur_price = closes[-1]
+                    ok = retest_ok(pending["dir"], pending["entry"], cur_price)
+
+                    if ok:
+                        emoji = "✅"
+                        side = "ENTER NOW (SAFE BUY)" if pending["dir"] == "BUY" else "ENTER NOW (SAFE SELL)"
+                        msg = (
+                            f"{emoji} {side}\n"
+                            f"BTC-USD\n"
+                            f"Current Price: {cur_price:.2f}\n"
+                            f"From Signal Price: {pending['entry']:.2f}\n"
+                            f"Retest: OK\n"
+                            f"Signals today: {signals_today}/{MAX_SIGNALS_PER_DAY}"
+                        )
+                        tg_send(msg)
+                    else:
+                        tg_send("⚠️ Retest Failed — Skip Trade")
+
+                    pending = None  # ننهي مرحلة الريتست
+
+            # 2) حساب الإشارة الطبيعية
             direction, info = decision_signal(closes, vols)
+
+            # log
             if info:
                 print(
                     f"[{datetime.now(timezone.utc)}] price={last_price} "
@@ -252,11 +310,19 @@ def main():
                 time.sleep(SAMPLE_INTERVAL_SEC)
                 continue
 
+            # 3) إذا طلعت إشارة جديدة، لا نرسل دخول مباشر — نرسل Detected ثم نفعّل retest
             now = time.time()
-            if direction and (now - last_signal_time >= COOLDOWN_SEC) and (signals_today < MAX_SIGNALS_PER_DAY):
+            can_signal = (
+                direction
+                and (now - last_signal_time >= COOLDOWN_SEC)
+                and (signals_today < MAX_SIGNALS_PER_DAY)
+                and (pending is None)  # لا نبدأ إشارة ثانية واحنا ننتظر retest
+            )
+
+            if can_signal:
                 emoji = "📈" if direction == "BUY" else "📉"
-                msg = (
-                    f"{emoji} {direction} (Decision)\n"
+                detected_msg = (
+                    f"{emoji} {direction} DETECTED\n"
                     f"BTC-USD\n"
                     f"Price: {info['price']:.2f}\n"
                     f"Move({SIGNAL_WINDOW_MIN}m): {info['move_pct']:.2f}%\n"
@@ -264,9 +330,18 @@ def main():
                     f"EMA{EMA_FAST}/{EMA_SLOW}: {info['ema_fast']:.2f} / {info['ema_slow']:.2f}\n"
                     f"Vol Spike: x{info['vol_ratio']:.2f}\n"
                     f"Breakout: {'UP ✅' if info['break_up'] else ('DOWN ✅' if info['break_down'] else 'NO')}\n"
+                    f"⏳ Waiting Retest: {RETEST_WAIT_SEC}s\n"
                     f"Signals today: {signals_today+1}/{MAX_SIGNALS_PER_DAY}"
                 )
-                tg_send(msg)
+                tg_send(detected_msg)
+
+                # فعّل مرحلة الريتست
+                if RETEST_ENABLED == "1":
+                    pending = {"dir": direction, "entry": info["price"], "ts": now, "info": info}
+                else:
+                    # إذا طفيته، يرجع سلوكنا القديم (إرسال مباشر)
+                    pass
+
                 last_signal_time = now
                 signals_today += 1
 
