@@ -22,17 +22,12 @@ EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 VOL_SPIKE = float(os.getenv("VOL_SPIKE", "1.8"))               # أقوى
 
-# Retest settings (NEW)
-RETEST_ENABLED = os.getenv("RETEST_ENABLED", "1").strip()  # 1=on, 0=off
-RETEST_WAIT_SEC = int(os.getenv("RETEST_WAIT_SEC", "60"))  # كم ننتظر قبل "ENTER NOW"
-RETEST_TOL_PCT = float(os.getenv("RETEST_TOL_PCT", "0.05")) # سماحية الرجوع ضد الاتجاه (%)
-
 # optional: force provider (BITSTAMP / COINBASE / KRAKEN / AUTO)
 DATA_SOURCE = os.getenv("DATA_SOURCE", "AUTO").strip().upper()
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "poly-decision-bot/2.2",
+    "User-Agent": "poly-decision-bot/2.3",
     "Accept": "application/json"
 })
 
@@ -142,6 +137,67 @@ def fetch_klines_1m(limit=250):
     return None, None, None
 
 # =============================
+# CONFIDENCE + SUGGESTED RISK
+# =============================
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def compute_confidence_and_risk(direction: str, info: dict):
+    """
+    Confidence: 55% إلى 92% (تقريبي) بناءً على قوة الشروط
+    Suggested Risk: نسبة من رأس المال لكل صفقة (0.5% إلى 2.5%)
+    """
+    score = 0.0  # 0..100
+
+    # 1) Trend strength (EMA spread)
+    ema_fast = info["ema_fast"]
+    ema_slow = info["ema_slow"]
+    spread_pct = abs(ema_fast - ema_slow) / info["price"] * 100  # %
+    # spread صغير = ترند ضعيف، spread أكبر = ترند أقوى
+    score += clamp(spread_pct / 0.15 * 18, 0, 18)  # 0..18
+
+    # 2) Momentum (RSI distance from neutral)
+    r = info["rsi"]
+    if direction == "BUY":
+        # أفضل لما RSI أعلى من 55
+        score += clamp((r - 50) / 20 * 22, 0, 22)  # 0..22
+    else:
+        # أفضل لما RSI أقل من 45
+        score += clamp((50 - r) / 20 * 22, 0, 22)  # 0..22
+
+    # 3) Move magnitude vs threshold
+    move = abs(info["move_pct"])
+    score += clamp((move - MIN_MOVE_PCT) / (MIN_MOVE_PCT) * 20, 0, 20)  # 0..20
+
+    # 4) Volume spike strength
+    volx = info["vol_ratio"]
+    # نعتبر > VOL_SPIKE جيد، وكل ما ارتفع أفضل
+    score += clamp((volx / VOL_SPIKE) * 22, 0, 22)  # 0..22
+
+    # 5) Breakout confirmation
+    if info["break_up"] or info["break_down"]:
+        score += 18  # 0 أو 18
+
+    # تحويل score إلى Confidence %
+    # baseline 55 + (score scaled)
+    confidence = 55 + (score / 100.0) * 37  # 55..92 تقريباً
+    confidence = clamp(confidence, 55, 92)
+
+    # Risk level + suggested position sizing (% of bankroll)
+    # كل ما زادت الثقة، نرفع المخاطرة بشكل بسيط فقط
+    if confidence >= 80:
+        risk_level = "LOW 🟢"
+        suggested_risk = 1.5  # % of bankroll
+    elif confidence >= 70:
+        risk_level = "MEDIUM 🟡"
+        suggested_risk = 1.0
+    else:
+        risk_level = "HIGH 🔴"
+        suggested_risk = 0.5
+
+    return round(confidence), risk_level, suggested_risk
+
+# =============================
 # DECISION ENGINE
 # =============================
 def decision_signal(closes, vols):
@@ -208,9 +264,7 @@ def decision_signal(closes, vols):
         "rsi": r,
         "vol_ratio": vol_ratio,
         "break_up": break_up,
-        "break_down": break_down,
-        "recent_high": recent_high,
-        "recent_low": recent_low
+        "break_down": break_down
     }
 
     if buy_ok:
@@ -220,28 +274,6 @@ def decision_signal(closes, vols):
     return None, info
 
 # =============================
-# RETEST LOGIC
-# =============================
-def retest_ok(direction: str, entry_price: float, current_price: float) -> bool:
-    """
-    هدفها تمنع الدخول المبكر:
-    - BUY: نسمح بدخول آمن إذا السعر ما رجع ضدنا أكثر من RETEST_TOL_PCT
-           و/أو بدأ يكمل فوق entry_price
-    - SELL: نفس الشي بالعكس
-    """
-    tol = RETEST_TOL_PCT / 100.0
-    if direction == "BUY":
-        # لو رجع ضدك كثير (نزل أكثر من tol) -> فخ
-        if current_price < entry_price * (1 - tol):
-            return False
-        # دخول آمن: السعر على الأقل رجع يثبت قريب/فوق entry
-        return current_price >= entry_price * (1 - tol/2)
-    else:  # SELL
-        if current_price > entry_price * (1 + tol):
-            return False
-        return current_price <= entry_price * (1 + tol/2)
-
-# =============================
 # MAIN LOOP
 # =============================
 def main():
@@ -249,19 +281,14 @@ def main():
         print("Missing BOT_TOKEN or CHAT_ID")
         return
 
-    tg_send("🟣 Poly Decision Bot started ✅ (AUTO providers + Retest)")
+    tg_send("🟣 Poly Decision Bot started ✅ (AUTO providers + Confidence)")
 
     last_signal_time = 0
     signals_today = 0
     current_day = datetime.now(timezone.utc).date()
 
-    # Retest state
-    pending = None
-    # pending = {"dir": "BUY/SELL", "entry": price, "ts": time.time(), "info": info}
-
     while True:
         try:
-            # reset daily counter
             today = datetime.now(timezone.utc).date()
             if today != current_day:
                 current_day = today
@@ -272,33 +299,8 @@ def main():
                 time.sleep(20)
                 continue
 
-            # 1) إذا عندنا صفقة معلقة (Waiting Retest) نقيّمها
-            if pending and RETEST_ENABLED == "1":
-                if time.time() - pending["ts"] >= RETEST_WAIT_SEC:
-                    cur_price = closes[-1]
-                    ok = retest_ok(pending["dir"], pending["entry"], cur_price)
-
-                    if ok:
-                        emoji = "✅"
-                        side = "ENTER NOW (SAFE BUY)" if pending["dir"] == "BUY" else "ENTER NOW (SAFE SELL)"
-                        msg = (
-                            f"{emoji} {side}\n"
-                            f"BTC-USD\n"
-                            f"Current Price: {cur_price:.2f}\n"
-                            f"From Signal Price: {pending['entry']:.2f}\n"
-                            f"Retest: OK\n"
-                            f"Signals today: {signals_today}/{MAX_SIGNALS_PER_DAY}"
-                        )
-                        tg_send(msg)
-                    else:
-                        tg_send("⚠️ Retest Failed — Skip Trade")
-
-                    pending = None  # ننهي مرحلة الريتست
-
-            # 2) حساب الإشارة الطبيعية
             direction, info = decision_signal(closes, vols)
 
-            # log
             if info:
                 print(
                     f"[{datetime.now(timezone.utc)}] price={last_price} "
@@ -310,19 +312,13 @@ def main():
                 time.sleep(SAMPLE_INTERVAL_SEC)
                 continue
 
-            # 3) إذا طلعت إشارة جديدة، لا نرسل دخول مباشر — نرسل Detected ثم نفعّل retest
             now = time.time()
-            can_signal = (
-                direction
-                and (now - last_signal_time >= COOLDOWN_SEC)
-                and (signals_today < MAX_SIGNALS_PER_DAY)
-                and (pending is None)  # لا نبدأ إشارة ثانية واحنا ننتظر retest
-            )
+            if direction and (now - last_signal_time >= COOLDOWN_SEC) and (signals_today < MAX_SIGNALS_PER_DAY):
+                confidence, risk_level, suggested_risk = compute_confidence_and_risk(direction, info)
 
-            if can_signal:
                 emoji = "📈" if direction == "BUY" else "📉"
-                detected_msg = (
-                    f"{emoji} {direction} DETECTED\n"
+                msg = (
+                    f"{emoji} {direction} (Decision)\n"
                     f"BTC-USD\n"
                     f"Price: {info['price']:.2f}\n"
                     f"Move({SIGNAL_WINDOW_MIN}m): {info['move_pct']:.2f}%\n"
@@ -330,18 +326,15 @@ def main():
                     f"EMA{EMA_FAST}/{EMA_SLOW}: {info['ema_fast']:.2f} / {info['ema_slow']:.2f}\n"
                     f"Vol Spike: x{info['vol_ratio']:.2f}\n"
                     f"Breakout: {'UP ✅' if info['break_up'] else ('DOWN ✅' if info['break_down'] else 'NO')}\n"
-                    f"⏳ Waiting Retest: {RETEST_WAIT_SEC}s\n"
+                    f"\n"
+                    f"Confidence: {confidence}%\n"
+                    f"Risk Level: {risk_level}\n"
+                    f"Suggested Risk: {suggested_risk}%\n"
+                    f"\n"
                     f"Signals today: {signals_today+1}/{MAX_SIGNALS_PER_DAY}"
                 )
-                tg_send(detected_msg)
 
-                # فعّل مرحلة الريتست
-                if RETEST_ENABLED == "1":
-                    pending = {"dir": direction, "entry": info["price"], "ts": now, "info": info}
-                else:
-                    # إذا طفيته، يرجع سلوكنا القديم (إرسال مباشر)
-                    pass
-
+                tg_send(msg)
                 last_signal_time = now
                 signals_today += 1
 
