@@ -9,44 +9,42 @@ from datetime import datetime, timezone
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
-
 SAMPLE_INTERVAL_SEC = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))
 
 SIGNAL_WINDOW_MIN = int(os.getenv("SIGNAL_WINDOW_MIN", "15"))
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.20"))
+MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.35"))        # اقوى وافضل للصفقات القليلة
 
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "1800"))
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "1800"))          # 30m
 MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "4"))
 
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-VOL_SPIKE = float(os.getenv("VOL_SPIKE", "1.5"))
+VOL_SPIKE = float(os.getenv("VOL_SPIKE", "1.8"))               # اقوى
 
-# ✅ BYBIT API (بديل Binance)
-BYBIT_KLINES = "https://api.bybit.com/v5/market/kline"
+# optional: force a provider (BITSTAMP / COINBASE / KRAKEN / AUTO)
+DATA_SOURCE = os.getenv("DATA_SOURCE", "AUTO").strip().upper()
 
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "poly-decision-bot/2.0",
+    "Accept": "application/json"
+})
 
 # =============================
 # TELEGRAM
 # =============================
-def tg_send(text):
+def tg_send(text: str):
     if not BOT_TOKEN or not CHAT_ID:
         print("Missing BOT_TOKEN or CHAT_ID")
         return
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     try:
-        requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": text},
-            timeout=10
-        )
+        r = session.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=12)
+        if r.status_code != 200:
+            print("Telegram failed:", r.status_code, r.text[:200])
     except Exception as e:
         print("Telegram error:", e)
-
 
 # =============================
 # INDICATORS
@@ -54,87 +52,129 @@ def tg_send(text):
 def ema(values, period):
     if len(values) < period:
         return None
-
     k = 2 / (period + 1)
     e = values[0]
-
     for v in values[1:]:
         e = v * k + e * (1 - k)
-
     return e
-
 
 def rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
-
-    gains = 0
-    losses = 0
-
+    gains = 0.0
+    losses = 0.0
     for i in range(-period, 0):
         diff = closes[i] - closes[i - 1]
         if diff >= 0:
             gains += diff
         else:
-            losses += abs(diff)
-
+            losses += -diff
     if losses == 0:
-        return 100
-
+        return 100.0
     rs = (gains / period) / (losses / period)
-    return 100 - (100 / (1 + rs))
-
+    return 100.0 - (100.0 / (1.0 + rs))
 
 # =============================
-# FETCH DATA (BYBIT)
+# DATA PROVIDERS (1m candles)
+# returns closes(list), vols(list), last_close(float)
 # =============================
-def fetch_klines_1m(limit=200):
 
-    params = {
-        "category": "linear",
-        "symbol": SYMBOL,
-        "interval": "1",
-        "limit": limit
-    }
+def fetch_bitstamp(limit=250):
+    # step=60 seconds, limit up to 1000
+    url = "https://www.bitstamp.net/api/v2/ohlc/btcusd/"
+    params = {"step": 60, "limit": limit}
+    r = session.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    data = r.json()["data"]["ohlc"]  # list of dicts oldest->newest? usually oldest->newest
+    closes = [float(x["close"]) for x in data]
+    vols = [float(x["volume"]) for x in data]
+    return closes, vols, closes[-1]
 
-    try:
-        r = requests.get(BYBIT_KLINES, params=params, timeout=10)
-        r.raise_for_status()
+def fetch_coinbase(limit=250):
+    # Coinbase Exchange (public). returns newest->oldest
+    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+    params = {"granularity": 60}  # 1m
+    r = session.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    data = data[:limit]
+    data = list(reversed(data))  # to oldest->newest
+    closes = [float(x[4]) for x in data]
+    vols = [float(x[5]) for x in data]
+    return closes, vols, closes[-1]
 
-        data = r.json()["result"]["list"]
+def fetch_kraken(limit=250):
+    # Kraken OHLC returns oldest->newest, volume available
+    url = "https://api.kraken.com/0/public/OHLC"
+    params = {"pair": "XBTUSD", "interval": 1}
+    r = session.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    key = next(iter(j["result"].keys() - {"last"}))
+    data = j["result"][key]
+    data = data[-limit:]
+    closes = [float(x[4]) for x in data]
+    vols = [float(x[6]) for x in data]
+    return closes, vols, closes[-1]
 
-        closes = [float(x[4]) for x in reversed(data)]
-        vols = [float(x[5]) for x in reversed(data)]
+def fetch_klines_1m(limit=250):
+    # AUTO fallback
+    providers = []
+    if DATA_SOURCE == "BITSTAMP":
+        providers = [fetch_bitstamp]
+    elif DATA_SOURCE == "COINBASE":
+        providers = [fetch_coinbase]
+    elif DATA_SOURCE == "KRAKEN":
+        providers = [fetch_kraken]
+    else:
+        providers = [fetch_bitstamp, fetch_coinbase, fetch_kraken]
 
-        return closes, vols, closes[-1]
+    last_err = None
+    for fn in providers:
+        try:
+            closes, vols, last = fn(limit=limit)
+            if closes and len(closes) >= 60:
+                return closes, vols, last
+        except Exception as e:
+            last_err = e
+            print(f"{fn.__name__} error:", e)
 
-    except Exception as e:
-        print("Klines fetch error:", e)
-        return None, None, None
-
+    print("All providers failed:", last_err)
+    return None, None, None
 
 # =============================
 # DECISION ENGINE
 # =============================
 def decision_signal(closes, vols):
-
     n = SIGNAL_WINDOW_MIN
-
-    if len(closes) < EMA_SLOW + 10:
+    if len(closes) < max(EMA_SLOW + 10, RSI_PERIOD + 10, n + 5):
         return None, None
 
     last = closes[-1]
     first = closes[-(n + 1)]
-
     move_pct = ((last - first) / first) * 100
 
-    ema_fast = ema(closes[-EMA_FAST * 3:], EMA_FAST)
-    ema_slow = ema(closes[-EMA_SLOW * 3:], EMA_SLOW)
+    ema_fast = ema(closes[-(EMA_FAST * 3):], EMA_FAST)
+    ema_slow = ema(closes[-(EMA_SLOW * 3):], EMA_SLOW)
+    if ema_fast is None or ema_slow is None:
+        return None, None
 
     r = rsi(closes, RSI_PERIOD)
+    if r is None:
+        return None, None
 
-    avg_vol = sum(vols[-30:]) / 30
-    vol_ratio = vols[-1] / avg_vol if avg_vol else 0
+    # volume spike (آخر دقيقة مقارنة بمتوسط آخر 30 دقيقة)
+    lookback = 30
+    if len(vols) < lookback + 2:
+        return None, None
+    avg_vol = sum(vols[-lookback:]) / lookback
+    vol_ratio = (vols[-1] / avg_vol) if avg_vol > 0 else 0
+
+    # Breakout filter (قوي): كسر نطاق آخر 15 دقيقة
+    recent_high = max(closes[-(n+1):-1])
+    recent_low = min(closes[-(n+1):-1])
+    break_up = last > recent_high
+    break_down = last < recent_low
 
     trend_up = ema_fast > ema_slow
     trend_down = ema_fast < ema_slow
@@ -143,92 +183,92 @@ def decision_signal(closes, vols):
         trend_up and
         r >= 52 and
         move_pct >= MIN_MOVE_PCT and
-        vol_ratio >= VOL_SPIKE
+        vol_ratio >= VOL_SPIKE and
+        break_up
     )
 
     sell_ok = (
         trend_down and
         r <= 48 and
         move_pct <= -MIN_MOVE_PCT and
-        vol_ratio >= VOL_SPIKE
+        vol_ratio >= VOL_SPIKE and
+        break_down
     )
 
     info = {
         "price": last,
-        "move": move_pct,
-        "rsi": r,
-        "vol": vol_ratio,
+        "move_pct": move_pct,
         "ema_fast": ema_fast,
-        "ema_slow": ema_slow
+        "ema_slow": ema_slow,
+        "rsi": r,
+        "vol_ratio": vol_ratio,
+        "break_up": break_up,
+        "break_down": break_down
     }
 
     if buy_ok:
         return "BUY", info
-
     if sell_ok:
         return "SELL", info
-
     return None, info
-
 
 # =============================
 # MAIN LOOP
 # =============================
 def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Missing BOT_TOKEN or CHAT_ID")
+        return
 
-    tg_send("🟣 Poly Decision Bot started ✅")
+    tg_send("🟣 Poly Decision Bot started ✅ (AUTO providers)")
 
-    last_signal = 0
+    last_signal_time = 0
     signals_today = 0
-    day = datetime.now(timezone.utc).date()
+    current_day = datetime.now(timezone.utc).date()
 
     while True:
+        try:
+            today = datetime.now(timezone.utc).date()
+            if today != current_day:
+                current_day = today
+                signals_today = 0
 
-        today = datetime.now(timezone.utc).date()
-        if today != day:
-            signals_today = 0
-            day = today
+            closes, vols, last_price = fetch_klines_1m(limit=250)
+            if closes is None:
+                time.sleep(20)
+                continue
 
-        closes, vols, price = fetch_klines_1m(250)
+            direction, info = decision_signal(closes, vols)
+            if info:
+                print(f"[{datetime.now(timezone.utc)}] price={last_price} move{SIGNAL_WINDOW_MIN}m={info['move_pct']:.3f}% rsi={info['rsi']:.1f} volx={info['vol_ratio']:.2f}")
+            else:
+                print(f"[{datetime.now(timezone.utc)}] price={last_price} waiting")
+                time.sleep(SAMPLE_INTERVAL_SEC)
+                continue
 
-        if closes is None:
-            time.sleep(20)
-            continue
+            now = time.time()
+            if direction and (now - last_signal_time >= COOLDOWN_SEC) and (signals_today < MAX_SIGNALS_PER_DAY):
+                emoji = "📈" if direction == "BUY" else "📉"
+                msg = (
+                    f"{emoji} {direction} (Decision)\n"
+                    f"BTC-USD\n"
+                    f"Price: {info['price']:.2f}\n"
+                    f"Move({SIGNAL_WINDOW_MIN}m): {info['move_pct']:.2f}%\n"
+                    f"RSI({RSI_PERIOD}): {info['rsi']:.1f}\n"
+                    f"EMA{EMA_FAST}/{EMA_SLOW}: {info['ema_fast']:.2f} / {info['ema_slow']:.2f}\n"
+                    f"Vol Spike: x{info['vol_ratio']:.2f}\n"
+                    f"Breakout: {'UP ✅' if info['break_up'] else ('DOWN ✅' if info['break_down'] else 'NO')}\n"
+                    f"Signals today: {signals_today+1}/{MAX_SIGNALS_PER_DAY}"
+                )
+                tg_send(msg)
+                last_signal_time = now
+                signals_today += 1
 
-        direction, info = decision_signal(closes, vols)
+            time.sleep(SAMPLE_INTERVAL_SEC)
 
-        print(
-            f"{price} | move={info['move']:.3f}% "
-            f"RSI={info['rsi']:.1f} Vol={info['vol']:.2f}"
-        )
-
-        now = time.time()
-
-        if (
-            direction
-            and now - last_signal > COOLDOWN_SEC
-            and signals_today < MAX_SIGNALS_PER_DAY
-        ):
-
-            emoji = "📈" if direction == "BUY" else "📉"
-
-            msg = (
-                f"{emoji} {direction} SIGNAL\n"
-                f"{SYMBOL}\n"
-                f"Price: {info['price']:.2f}\n"
-                f"Move(15m): {info['move']:.2f}%\n"
-                f"RSI: {info['rsi']:.1f}\n"
-                f"Volume Spike: x{info['vol']:.2f}\n"
-                f"Signals Today: {signals_today+1}/{MAX_SIGNALS_PER_DAY}"
-            )
-
-            tg_send(msg)
-
-            last_signal = now
-            signals_today += 1
-
-        time.sleep(SAMPLE_INTERVAL_SEC)
-
+        except Exception as e:
+            print("Loop error:", e)
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
