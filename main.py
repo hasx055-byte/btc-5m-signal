@@ -2,7 +2,6 @@ import os
 import time
 import requests
 from datetime import datetime, timezone
-from collections import deque
 
 # =============================
 # CONFIG (Railway Variables)
@@ -95,23 +94,31 @@ def fetch_klines_1m(limit=200):
 # =============================
 def decision_signal(closes, vols):
     """
-    Returns: (direction_str, info_dict) or (None, None)
+    Returns: (direction_str, info_dict) or (None, info_dict/None)
+
     Filters:
     1) Trend: EMA_FAST vs EMA_SLOW
     2) Momentum: RSI
     3) Move over last SIGNAL_WINDOW_MIN minutes
     4) Volume spike: last vol vs avg vol
+    5) Breakout: last close breaks last n-min range (strong filter)
     """
     n = SIGNAL_WINDOW_MIN
     if len(closes) < max(EMA_SLOW + 5, RSI_PERIOD + 5, n + 2):
         return None, None
 
     last = closes[-1]
-    first = closes[-(n+1)]
+    first = closes[-(n + 1)]
     move_pct = ((last - first) / first) * 100
 
-    ema_fast = ema(closes[-(EMA_FAST*3):], EMA_FAST)  # small slice ok
-    ema_slow = ema(closes[-(EMA_SLOW*3):], EMA_SLOW)
+    # Breakout filter: last close must break the last n minutes range
+    recent_high = max(closes[-(n+1):-1])
+    recent_low  = min(closes[-(n+1):-1])
+    break_up = last > recent_high
+    break_down = last < recent_low
+
+    ema_fast = ema(closes[-(EMA_FAST * 3):], EMA_FAST)
+    ema_slow = ema(closes[-(EMA_SLOW * 3):], EMA_SLOW)
     if ema_fast is None or ema_slow is None:
         return None, None
 
@@ -123,26 +130,29 @@ def decision_signal(closes, vols):
     lookback = 30
     if len(vols) < lookback + 2:
         return None, None
+
     avg_vol = sum(vols[-lookback:]) / lookback
     vol_ratio = (vols[-1] / avg_vol) if avg_vol > 0 else 0
 
     trend_up = ema_fast > ema_slow
     trend_down = ema_fast < ema_slow
 
-    # Buy conditions (stronger than simple move)
+    # Buy conditions (strong)
     buy_ok = (
         trend_up and
         r >= 52 and
         move_pct >= MIN_MOVE_PCT and
-        vol_ratio >= VOL_SPIKE
+        vol_ratio >= VOL_SPIKE and
+        break_up
     )
 
-    # Sell conditions
+    # Sell conditions (strong)
     sell_ok = (
         trend_down and
         r <= 48 and
         move_pct <= -MIN_MOVE_PCT and
-        vol_ratio >= VOL_SPIKE
+        vol_ratio >= VOL_SPIKE and
+        break_down
     )
 
     info = {
@@ -151,7 +161,11 @@ def decision_signal(closes, vols):
         "ema_fast": ema_fast,
         "ema_slow": ema_slow,
         "rsi": r,
-        "vol_ratio": vol_ratio
+        "vol_ratio": vol_ratio,
+        "break_up": break_up,
+        "break_down": break_down,
+        "recent_high": recent_high,
+        "recent_low": recent_low
     }
 
     if buy_ok:
@@ -172,7 +186,6 @@ def main():
 
     last_signal_time = 0
     signals_today = 0
-    # reset counter by UTC day (good enough)
     current_day = datetime.now(timezone.utc).date()
 
     while True:
@@ -188,10 +201,26 @@ def main():
                 continue
 
             direction, info = decision_signal(closes, vols)
-            print(f"[{datetime.now(timezone.utc)}] price={last_price} move15m={info['move_pct']:.3f}% rsi={info['rsi']:.1f} volx={info['vol_ratio']:.2f}")
+
+            # ✅ Prevent crash if info is None
+            if info:
+                print(
+                    f"[{datetime.now(timezone.utc)}] price={last_price} "
+                    f"move{SIGNAL_WINDOW_MIN}m={info['move_pct']:.3f}% "
+                    f"rsi={info['rsi']:.1f} volx={info['vol_ratio']:.2f} "
+                    f"breakUp={info['break_up']} breakDown={info['break_down']}"
+                )
+            else:
+                print(f"[{datetime.now(timezone.utc)}] price={last_price} waiting (insufficient data)")
+                time.sleep(SAMPLE_INTERVAL_SEC)
+                continue
 
             now = time.time()
-            if direction and (now - last_signal_time >= COOLDOWN_SEC) and (signals_today < MAX_SIGNALS_PER_DAY):
+            if (
+                direction
+                and (now - last_signal_time >= COOLDOWN_SEC)
+                and (signals_today < MAX_SIGNALS_PER_DAY)
+            ):
                 emoji = "📈" if direction == "BUY" else "📉"
                 msg = (
                     f"{emoji} {direction} (15m)\n"
@@ -201,6 +230,7 @@ def main():
                     f"RSI({RSI_PERIOD}): {info['rsi']:.1f}\n"
                     f"EMA{EMA_FAST}/{EMA_SLOW}: {info['ema_fast']:.2f} / {info['ema_slow']:.2f}\n"
                     f"Vol Spike: x{info['vol_ratio']:.2f}\n"
+                    f"Breakout: {'UP ✅' if info['break_up'] else ('DOWN ✅' if info['break_down'] else 'NO')}\n"
                     f"Signals today: {signals_today+1}/{MAX_SIGNALS_PER_DAY}"
                 )
                 tg_send(msg)
