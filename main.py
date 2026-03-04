@@ -22,12 +22,22 @@ EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 VOL_SPIKE = float(os.getenv("VOL_SPIKE", "1.8"))               # أقوى
 
+# ✅ NEW: Confidence filter (لا نرسل إلا إذا الثقة أعلى من الحد)
+MIN_CONF_SEND = int(os.getenv("MIN_CONF_SEND", "75"))
+
+# ✅ NEW: Volatility Trap Filter (فخ الشمعة/سبايك الأخبار)
+# إذا آخر دقيقة كانت “مجنونة” مقارنة بمتوسط آخر X دقائق، نتجاهل الإشارة
+VOL_TRAP_ENABLED = os.getenv("VOL_TRAP_ENABLED", "1").strip()   # 1=on, 0=off
+VOL_TRAP_LOOKBACK = int(os.getenv("VOL_TRAP_LOOKBACK", "30"))   # متوسط كم دقيقة
+VOL_TRAP_MULT = float(os.getenv("VOL_TRAP_MULT", "3.0"))        # كم مرة أكبر من المتوسط تعتبر فخ
+VOL_TRAP_MIN_PCT = float(os.getenv("VOL_TRAP_MIN_PCT", "0.25")) # أقل سبايك % عشان نعتبره فخ
+
 # optional: force provider (BITSTAMP / COINBASE / KRAKEN / AUTO)
 DATA_SOURCE = os.getenv("DATA_SOURCE", "AUTO").strip().upper()
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "poly-decision-bot/2.3",
+    "User-Agent": "poly-decision-bot/3.1",
     "Accept": "application/json"
 })
 
@@ -137,57 +147,43 @@ def fetch_klines_1m(limit=250):
     return None, None, None
 
 # =============================
-# CONFIDENCE + SUGGESTED RISK
+# CONFIDENCE + RISK
 # =============================
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 def compute_confidence_and_risk(direction: str, info: dict):
-    """
-    Confidence: 55% إلى 92% (تقريبي) بناءً على قوة الشروط
-    Suggested Risk: نسبة من رأس المال لكل صفقة (0.5% إلى 2.5%)
-    """
     score = 0.0  # 0..100
 
-    # 1) Trend strength (EMA spread)
-    ema_fast = info["ema_fast"]
-    ema_slow = info["ema_slow"]
-    spread_pct = abs(ema_fast - ema_slow) / info["price"] * 100  # %
-    # spread صغير = ترند ضعيف، spread أكبر = ترند أقوى
+    # Trend strength (EMA spread)
+    spread_pct = abs(info["ema_fast"] - info["ema_slow"]) / info["price"] * 100
     score += clamp(spread_pct / 0.15 * 18, 0, 18)  # 0..18
 
-    # 2) Momentum (RSI distance from neutral)
+    # Momentum (RSI)
     r = info["rsi"]
     if direction == "BUY":
-        # أفضل لما RSI أعلى من 55
         score += clamp((r - 50) / 20 * 22, 0, 22)  # 0..22
     else:
-        # أفضل لما RSI أقل من 45
         score += clamp((50 - r) / 20 * 22, 0, 22)  # 0..22
 
-    # 3) Move magnitude vs threshold
+    # Move magnitude vs threshold
     move = abs(info["move_pct"])
     score += clamp((move - MIN_MOVE_PCT) / (MIN_MOVE_PCT) * 20, 0, 20)  # 0..20
 
-    # 4) Volume spike strength
+    # Volume spike
     volx = info["vol_ratio"]
-    # نعتبر > VOL_SPIKE جيد، وكل ما ارتفع أفضل
     score += clamp((volx / VOL_SPIKE) * 22, 0, 22)  # 0..22
 
-    # 5) Breakout confirmation
+    # Breakout confirmation
     if info["break_up"] or info["break_down"]:
-        score += 18  # 0 أو 18
+        score += 18  # 0 or 18
 
-    # تحويل score إلى Confidence %
-    # baseline 55 + (score scaled)
-    confidence = 55 + (score / 100.0) * 37  # 55..92 تقريباً
+    confidence = 55 + (score / 100.0) * 37  # 55..92
     confidence = clamp(confidence, 55, 92)
 
-    # Risk level + suggested position sizing (% of bankroll)
-    # كل ما زادت الثقة، نرفع المخاطرة بشكل بسيط فقط
     if confidence >= 80:
         risk_level = "LOW 🟢"
-        suggested_risk = 1.5  # % of bankroll
+        suggested_risk = 1.5
     elif confidence >= 70:
         risk_level = "MEDIUM 🟡"
         suggested_risk = 1.0
@@ -195,7 +191,54 @@ def compute_confidence_and_risk(direction: str, info: dict):
         risk_level = "HIGH 🔴"
         suggested_risk = 0.5
 
-    return round(confidence), risk_level, suggested_risk
+    return int(round(confidence)), risk_level, suggested_risk
+
+# =============================
+# NEW: VOLATILITY TRAP FILTER
+# =============================
+def volatility_trap(closes):
+    """
+    يعتمد على عوائد دقيقة واحدة:
+    - spike_pct = |آخر تغير 1m|
+    - avg_pct = متوسط |التغير| خلال lookback
+    يعتبر فخ إذا spike_pct >= VOL_TRAP_MIN_PCT
+    و spike_pct >= VOL_TRAP_MULT * avg_pct
+    """
+    if VOL_TRAP_ENABLED != "1":
+        return False, {"spike_pct": 0.0, "avg_pct": 0.0}
+
+    lb = VOL_TRAP_LOOKBACK
+    if len(closes) < lb + 3:
+        return False, {"spike_pct": 0.0, "avg_pct": 0.0}
+
+    prev = closes[-2]
+    last = closes[-1]
+    if prev <= 0:
+        return False, {"spike_pct": 0.0, "avg_pct": 0.0}
+
+    spike_pct = abs((last - prev) / prev) * 100
+
+    # متوسط تغيرات آخر lb دقائق (absolute returns)
+    abs_rets = []
+    start = -(lb + 1)
+    for i in range(start, -1):
+        p0 = closes[i - 1]
+        p1 = closes[i]
+        if p0 <= 0:
+            continue
+        abs_rets.append(abs((p1 - p0) / p0) * 100)
+
+    if not abs_rets:
+        return False, {"spike_pct": spike_pct, "avg_pct": 0.0}
+
+    avg_pct = sum(abs_rets) / len(abs_rets)
+
+    # حماية من avg = 0
+    if avg_pct < 0.0001:
+        return False, {"spike_pct": spike_pct, "avg_pct": avg_pct}
+
+    is_trap = (spike_pct >= VOL_TRAP_MIN_PCT) and (spike_pct >= VOL_TRAP_MULT * avg_pct)
+    return is_trap, {"spike_pct": spike_pct, "avg_pct": avg_pct}
 
 # =============================
 # DECISION ENGINE
@@ -224,14 +267,9 @@ def decision_signal(closes, vols):
     if len(vols) < lookback + 2:
         return None, None
     avg_vol = sum(vols[-lookback:]) / lookback
+    vol_ratio = 1.0 if avg_vol < 0.0001 else (vols[-1] / avg_vol)
 
-    # ✅ إذا الحجم غير موثوق (قريب من صفر) نخليه محايد بدل 0.00
-    if avg_vol < 0.0001:
-        vol_ratio = 1.0
-    else:
-        vol_ratio = vols[-1] / avg_vol
-
-    # Breakout filter (قوي)
+    # Breakout filter
     recent_high = max(closes[-(n+1):-1])
     recent_low = min(closes[-(n+1):-1])
     break_up = last > recent_high
@@ -281,7 +319,7 @@ def main():
         print("Missing BOT_TOKEN or CHAT_ID")
         return
 
-    tg_send("🟣 Poly Decision Bot started ✅ (AUTO providers + Confidence)")
+    tg_send("🟣 Poly Decision Bot started ✅ (Confidence>=75 + VolTrap)")
 
     last_signal_time = 0
     signals_today = 0
@@ -289,6 +327,7 @@ def main():
 
     while True:
         try:
+            # reset daily counter
             today = datetime.now(timezone.utc).date()
             if today != current_day:
                 current_day = today
@@ -299,44 +338,74 @@ def main():
                 time.sleep(20)
                 continue
 
+            # Volatility trap check (قبل الإشارة)
+            is_trap, trap_info = volatility_trap(closes)
+
             direction, info = decision_signal(closes, vols)
 
+            # logs
             if info:
                 print(
                     f"[{datetime.now(timezone.utc)}] price={last_price} "
                     f"move{SIGNAL_WINDOW_MIN}m={info['move_pct']:.3f}% "
-                    f"rsi={info['rsi']:.1f} volx={info['vol_ratio']:.2f}"
+                    f"rsi={info['rsi']:.1f} volx={info['vol_ratio']:.2f} "
+                    f"trap={is_trap} spike={trap_info['spike_pct']:.3f}% avg={trap_info['avg_pct']:.3f}%"
                 )
             else:
-                print(f"[{datetime.now(timezone.utc)}] price={last_price} waiting")
+                print(
+                    f"[{datetime.now(timezone.utc)}] price={last_price} waiting "
+                    f"trap={is_trap} spike={trap_info['spike_pct']:.3f}% avg={trap_info['avg_pct']:.3f}%"
+                )
                 time.sleep(SAMPLE_INTERVAL_SEC)
                 continue
 
             now = time.time()
-            if direction and (now - last_signal_time >= COOLDOWN_SEC) and (signals_today < MAX_SIGNALS_PER_DAY):
+
+            # لو وصلنا حد الصفقات ما نرسل
+            if signals_today >= MAX_SIGNALS_PER_DAY:
+                time.sleep(SAMPLE_INTERVAL_SEC)
+                continue
+
+            # إذا فيه إشارة، نحسب confidence
+            if direction:
                 confidence, risk_level, suggested_risk = compute_confidence_and_risk(direction, info)
 
-                emoji = "📈" if direction == "BUY" else "📉"
-                msg = (
-                    f"{emoji} {direction} (Decision)\n"
-                    f"BTC-USD\n"
-                    f"Price: {info['price']:.2f}\n"
-                    f"Move({SIGNAL_WINDOW_MIN}m): {info['move_pct']:.2f}%\n"
-                    f"RSI({RSI_PERIOD}): {info['rsi']:.1f}\n"
-                    f"EMA{EMA_FAST}/{EMA_SLOW}: {info['ema_fast']:.2f} / {info['ema_slow']:.2f}\n"
-                    f"Vol Spike: x{info['vol_ratio']:.2f}\n"
-                    f"Breakout: {'UP ✅' if info['break_up'] else ('DOWN ✅' if info['break_down'] else 'NO')}\n"
-                    f"\n"
-                    f"Confidence: {confidence}%\n"
-                    f"Risk Level: {risk_level}\n"
-                    f"Suggested Risk: {suggested_risk}%\n"
-                    f"\n"
-                    f"Signals today: {signals_today+1}/{MAX_SIGNALS_PER_DAY}"
-                )
+                # ✅ NEW: Confidence filter
+                if confidence < MIN_CONF_SEND:
+                    # ما نرسل (فرصة متوسطة/ضعيفة)
+                    time.sleep(SAMPLE_INTERVAL_SEC)
+                    continue
 
-                tg_send(msg)
-                last_signal_time = now
-                signals_today += 1
+                # ✅ NEW: Volatility trap filter
+                if is_trap:
+                    # تجاهل الإشارة لأن فيه spike غير طبيعي
+                    # (نقدر نرسل تحذير لو تبغى، حالياً نخليه صامت عشان ما يزعج)
+                    time.sleep(SAMPLE_INTERVAL_SEC)
+                    continue
+
+                # cooldown + send
+                if (now - last_signal_time >= COOLDOWN_SEC):
+                    emoji = "📈" if direction == "BUY" else "📉"
+                    msg = (
+                        f"{emoji} {direction} (Decision)\n"
+                        f"BTC-USD\n"
+                        f"Price: {info['price']:.2f}\n"
+                        f"Move({SIGNAL_WINDOW_MIN}m): {info['move_pct']:.2f}%\n"
+                        f"RSI({RSI_PERIOD}): {info['rsi']:.1f}\n"
+                        f"EMA{EMA_FAST}/{EMA_SLOW}: {info['ema_fast']:.2f} / {info['ema_slow']:.2f}\n"
+                        f"Vol Spike: x{info['vol_ratio']:.2f}\n"
+                        f"Breakout: {'UP ✅' if info['break_up'] else ('DOWN ✅' if info['break_down'] else 'NO')}\n"
+                        f"\n"
+                        f"Confidence: {confidence}%\n"
+                        f"Risk Level: {risk_level}\n"
+                        f"Suggested Risk: {suggested_risk}%\n"
+                        f"\n"
+                        f"Signals today: {signals_today+1}/{MAX_SIGNALS_PER_DAY}"
+                    )
+
+                    tg_send(msg)
+                    last_signal_time = now
+                    signals_today += 1
 
             time.sleep(SAMPLE_INTERVAL_SEC)
 
