@@ -4,7 +4,7 @@ import requests
 from datetime import datetime, timezone
 
 # =============================
-# CONFIG (Railway Variables)
+# CONFIG
 # =============================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
@@ -33,16 +33,33 @@ ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.10"))
 MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.80"))
 
-# NEW: Early setup / Strong momentum
 EARLY_SETUP_ENABLED = os.getenv("EARLY_SETUP_ENABLED", "1").strip()
-EARLY_COOLDOWN_SEC = int(os.getenv("EARLY_COOLDOWN_SEC", "900"))   # 15m
+EARLY_COOLDOWN_SEC = int(os.getenv("EARLY_COOLDOWN_SEC", "900"))
 STRONG_MOMENTUM_MIN_CONF = int(os.getenv("STRONG_MOMENTUM_MIN_CONF", "88"))
+
+# NEW: Trend Filter (1H)
+TREND_FILTER_ENABLED = os.getenv("TREND_FILTER_ENABLED", "1").strip()
+TREND_FAST_1H = int(os.getenv("TREND_FAST_1H", "50"))
+TREND_SLOW_1H = int(os.getenv("TREND_SLOW_1H", "200"))
+
+# NEW: Momentum Acceleration
+ACCEL_ENABLED = os.getenv("ACCEL_ENABLED", "1").strip()
+ACCEL_MIN_SCORE = float(os.getenv("ACCEL_MIN_SCORE", "0.55"))
+
+# NEW: Orderbook
+ORDERBOOK_ENABLED = os.getenv("ORDERBOOK_ENABLED", "1").strip()
+ORDERBOOK_IMBALANCE_MIN = float(os.getenv("ORDERBOOK_IMBALANCE_MIN", "0.08"))
+ORDERBOOK_LEVELS = int(os.getenv("ORDERBOOK_LEVELS", "20"))
+
+# NEW: Liquidity Sweep
+SWEEP_ENABLED = os.getenv("SWEEP_ENABLED", "1").strip()
+SWEEP_LOOKBACK = int(os.getenv("SWEEP_LOOKBACK", "20"))
 
 DATA_SOURCE = os.getenv("DATA_SOURCE", "AUTO").strip().upper()
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "poly-decision-bot/5.0",
+    "User-Agent": "poly-decision-bot/6.0",
     "Accept": "application/json"
 })
 
@@ -64,6 +81,9 @@ def tg_send(text: str):
 # =============================
 # INDICATORS
 # =============================
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
 def ema(values, period):
     if len(values) < period:
         return None
@@ -97,21 +117,16 @@ def atr(highs, lows, closes, period=14):
         high = highs[i]
         low = lows[i]
         prev_close = closes[i - 1]
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close)
-        )
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
     return sum(trs) / len(trs)
 
 # =============================
 # DATA PROVIDERS
-# returns opens, highs, lows, closes, vols, last_close
 # =============================
-def fetch_bitstamp(limit=250):
+def fetch_bitstamp(limit=250, step=60):
     url = "https://www.bitstamp.net/api/v2/ohlc/btcusd/"
-    params = {"step": 60, "limit": limit}
+    params = {"step": step, "limit": limit}
     r = session.get(url, params=params, timeout=12)
     r.raise_for_status()
     data = r.json()["data"]["ohlc"]
@@ -122,14 +137,14 @@ def fetch_bitstamp(limit=250):
     vols = [float(x["volume"]) for x in data]
     return opens, highs, lows, closes, vols, closes[-1]
 
-def fetch_coinbase(limit=250):
+def fetch_coinbase(limit=250, granularity=60):
     url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
-    params = {"granularity": 60}
+    params = {"granularity": granularity}
     r = session.get(url, params=params, timeout=12)
     r.raise_for_status()
     data = r.json()
     data = data[:limit]
-    data = list(reversed(data))
+    data = list(reversed(data))  # oldest -> newest
     opens = [float(x[3]) for x in data]
     highs = [float(x[2]) for x in data]
     lows = [float(x[1]) for x in data]
@@ -137,9 +152,9 @@ def fetch_coinbase(limit=250):
     vols = [float(x[5]) for x in data]
     return opens, highs, lows, closes, vols, closes[-1]
 
-def fetch_kraken(limit=250):
+def fetch_kraken(limit=250, interval=1):
     url = "https://api.kraken.com/0/public/OHLC"
-    params = {"pair": "XBTUSD", "interval": 1}
+    params = {"pair": "XBTUSD", "interval": interval}
     r = session.get(url, params=params, timeout=12)
     r.raise_for_status()
     j = r.json()
@@ -152,35 +167,131 @@ def fetch_kraken(limit=250):
     vols = [float(x[6]) for x in data]
     return opens, highs, lows, closes, vols, closes[-1]
 
-def fetch_klines_1m(limit=250):
+def fetch_1m(limit=250):
+    providers = []
     if DATA_SOURCE == "BITSTAMP":
-        providers = [fetch_bitstamp]
+        providers = [lambda: fetch_bitstamp(limit=limit, step=60)]
     elif DATA_SOURCE == "COINBASE":
-        providers = [fetch_coinbase]
+        providers = [lambda: fetch_coinbase(limit=limit, granularity=60)]
     elif DATA_SOURCE == "KRAKEN":
-        providers = [fetch_kraken]
+        providers = [lambda: fetch_kraken(limit=limit, interval=1)]
     else:
-        providers = [fetch_bitstamp, fetch_coinbase, fetch_kraken]
+        providers = [
+            lambda: fetch_bitstamp(limit=limit, step=60),
+            lambda: fetch_coinbase(limit=limit, granularity=60),
+            lambda: fetch_kraken(limit=limit, interval=1),
+        ]
 
     last_err = None
     for fn in providers:
         try:
-            opens, highs, lows, closes, vols, last = fn(limit=limit)
-            if closes and len(closes) >= 60:
-                return opens, highs, lows, closes, vols, last
+            return fn()
         except Exception as e:
             last_err = e
-            print(f"{fn.__name__} error:", e)
+            print("fetch_1m provider error:", e)
 
-    print("All providers failed:", last_err)
+    print("All 1m providers failed:", last_err)
+    return None, None, None, None, None, None
+
+def fetch_1h(limit=250):
+    providers = []
+    if DATA_SOURCE == "BITSTAMP":
+        providers = [lambda: fetch_bitstamp(limit=limit, step=3600)]
+    elif DATA_SOURCE == "COINBASE":
+        providers = [lambda: fetch_coinbase(limit=limit, granularity=3600)]
+    elif DATA_SOURCE == "KRAKEN":
+        providers = [lambda: fetch_kraken(limit=limit, interval=60)]
+    else:
+        providers = [
+            lambda: fetch_bitstamp(limit=limit, step=3600),
+            lambda: fetch_coinbase(limit=limit, granularity=3600),
+            lambda: fetch_kraken(limit=limit, interval=60),
+        ]
+
+    last_err = None
+    for fn in providers:
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            print("fetch_1h provider error:", e)
+
+    print("All 1h providers failed:", last_err)
     return None, None, None, None, None, None
 
 # =============================
-# HELPERS
+# ORDERBOOK
 # =============================
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+def fetch_orderbook_bitstamp():
+    url = "https://www.bitstamp.net/api/v2/order_book/btcusd/"
+    r = session.get(url, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    bids = j.get("bids", [])[:ORDERBOOK_LEVELS]
+    asks = j.get("asks", [])[:ORDERBOOK_LEVELS]
+    bid_vol = sum(float(x[1]) for x in bids)
+    ask_vol = sum(float(x[1]) for x in asks)
+    return bid_vol, ask_vol
 
+def fetch_orderbook_coinbase():
+    url = "https://api.exchange.coinbase.com/products/BTC-USD/book"
+    params = {"level": 2}
+    r = session.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    bids = j.get("bids", [])[:ORDERBOOK_LEVELS]
+    asks = j.get("asks", [])[:ORDERBOOK_LEVELS]
+    bid_vol = sum(float(x[1]) for x in bids)
+    ask_vol = sum(float(x[1]) for x in asks)
+    return bid_vol, ask_vol
+
+def fetch_orderbook_kraken():
+    url = "https://api.kraken.com/0/public/Depth"
+    params = {"pair": "XBTUSD", "count": ORDERBOOK_LEVELS}
+    r = session.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    j = r.json()
+    key = next(iter(j["result"].keys()))
+    bids = j["result"][key].get("bids", [])
+    asks = j["result"][key].get("asks", [])
+    bid_vol = sum(float(x[1]) for x in bids)
+    ask_vol = sum(float(x[1]) for x in asks)
+    return bid_vol, ask_vol
+
+def fetch_orderbook_imbalance():
+    if ORDERBOOK_ENABLED != "1":
+        return 0.0, "OFF"
+
+    providers = []
+    if DATA_SOURCE == "BITSTAMP":
+        providers = [fetch_orderbook_bitstamp]
+    elif DATA_SOURCE == "COINBASE":
+        providers = [fetch_orderbook_coinbase]
+    elif DATA_SOURCE == "KRAKEN":
+        providers = [fetch_orderbook_kraken]
+    else:
+        providers = [fetch_orderbook_bitstamp, fetch_orderbook_coinbase, fetch_orderbook_kraken]
+
+    last_err = None
+    for fn in providers:
+        try:
+            bid_vol, ask_vol = fn()
+            total = bid_vol + ask_vol
+            if total <= 0:
+                return 0.0, "Neutral"
+            imbalance = (bid_vol - ask_vol) / total
+            label = "Bullish" if imbalance > 0 else "Bearish" if imbalance < 0 else "Neutral"
+            return imbalance, label
+        except Exception as e:
+            last_err = e
+            print("orderbook provider error:", e)
+
+    print("All orderbook providers failed:", last_err)
+    return 0.0, "Neutral"
+
+# =============================
+# CANDLE / PRICE STRUCTURE
+# =============================
 def candle_strength(direction, o, h, l, c):
     candle_range = max(h - l, 1e-9)
     body = abs(c - o)
@@ -229,7 +340,6 @@ def candle_strength(direction, o, h, l, c):
             score -= 15
 
     score = clamp(score, 0, 100)
-
     if score >= 80:
         label = "Very Strong"
     elif score >= 65:
@@ -248,8 +358,7 @@ def wick_rejection(direction, o, h, l, c):
 
     if direction == "BUY":
         return upper_wick / candle_range >= 0.45
-    else:
-        return lower_wick / candle_range >= 0.45
+    return lower_wick / candle_range >= 0.45
 
 def volatility_trap(closes):
     if VOL_TRAP_ENABLED != "1":
@@ -284,82 +393,124 @@ def volatility_trap(closes):
     is_trap = (spike_pct >= VOL_TRAP_MIN_PCT) and (spike_pct >= VOL_TRAP_MULT * avg_pct)
     return is_trap, {"spike_pct": spike_pct, "avg_pct": avg_pct}
 
-def compute_confidence_and_risk(direction: str, info: dict):
-    score = 0.0
+def liquidity_sweep_signal(direction, highs, lows, closes):
+    if SWEEP_ENABLED != "1":
+        return False, "OFF"
 
-    spread_pct = abs(info["ema_fast"] - info["ema_slow"]) / info["price"] * 100
-    score += clamp(spread_pct / 0.15 * 16, 0, 16)
+    lb = SWEEP_LOOKBACK
+    if len(closes) < lb + 4:
+        return False, "No data"
 
-    r = info["rsi"]
-    if direction == "BUY":
-        score += clamp((r - 50) / 20 * 18, 0, 18)
-    else:
-        score += clamp((50 - r) / 20 * 18, 0, 18)
+    recent_high = max(highs[-(lb+3):-3])
+    recent_low = min(lows[-(lb+3):-3])
 
-    move = abs(info["move_pct"])
-    score += clamp((move - MIN_MOVE_PCT) / MIN_MOVE_PCT * 16, 0, 16)
-
-    volx = info["vol_ratio"]
-    score += clamp((volx / VOL_SPIKE) * 18, 0, 18)
-
-    if info["break_up"] or info["break_down"]:
-        score += 12
-
-    score += clamp(info["candle_strength_score"] / 100 * 12, 0, 12)
-
-    atr_pct_val = info["atr_pct"]
-    if MIN_ATR_PCT <= atr_pct_val <= MAX_ATR_PCT:
-        score += 10
-
-    confidence = 55 + (score / 100.0) * 37
-    confidence = clamp(confidence, 55, 92)
-
-    if confidence >= 80:
-        risk_level = "LOW 🟢"
-        suggested_risk = 1.5
-    elif confidence >= 70:
-        risk_level = "MEDIUM 🟡"
-        suggested_risk = 1.0
-    else:
-        risk_level = "HIGH 🔴"
-        suggested_risk = 0.5
-
-    return int(round(confidence)), risk_level, suggested_risk
-
-def entry_timing_label(direction, info):
-    if info["wick_rejection"]:
-        return "SKIP", "Wick rejection"
-
-    if info["atr_pct"] < MIN_ATR_PCT:
-        return "SKIP", "Low volatility"
-
-    if info["atr_pct"] > MAX_ATR_PCT:
-        return "WAIT 1 CANDLE", "ATR too hot"
+    # نفحص آخر 3 شموع فقط
+    last_close = closes[-1]
+    last_high = highs[-1]
+    last_low = lows[-1]
 
     if direction == "BUY":
-        if info["rsi"] >= 75:
-            return "WAIT 1 CANDLE", "RSI high"
-        if info["candle_strength_score"] >= 75 and info["vol_ratio"] >= 2.0:
-            return "ENTER NOW", "Strong bullish candle"
-        return "WAIT 1 CANDLE", "Need extra confirmation"
+        # sweep downside then reclaim
+        if last_low < recent_low and last_close > recent_low:
+            return True, "Downside liquidity sweep reclaimed"
+        return False, "No bullish sweep"
 
     if direction == "SELL":
-        if info["rsi"] <= 25:
-            return "WAIT 1 CANDLE", "RSI too low"
-        if info["candle_strength_score"] >= 75 and info["vol_ratio"] >= 2.0:
-            return "ENTER NOW", "Strong bearish candle"
-        return "WAIT 1 CANDLE", "Need extra confirmation"
+        # sweep upside then reject
+        if last_high > recent_high and last_close < recent_high:
+            return True, "Upside liquidity sweep rejected"
+        return False, "No bearish sweep"
 
-    return "SKIP", "No valid direction"
+    return False, "No direction"
+
+def trend_filter_1h(direction, closes_1h):
+    if TREND_FILTER_ENABLED != "1":
+        return True, {"fast": 0.0, "slow": 0.0, "label": "OFF"}
+
+    fast = ema(closes_1h[-(TREND_FAST_1H * 3):], TREND_FAST_1H)
+    slow = ema(closes_1h[-(TREND_SLOW_1H * 2 + 20):], TREND_SLOW_1H)
+    if fast is None or slow is None:
+        return False, {"fast": 0.0, "slow": 0.0, "label": "No data"}
+
+    if direction == "BUY":
+        ok = fast > slow
+        label = "Bullish" if ok else "Against trend"
+    else:
+        ok = fast < slow
+        label = "Bearish" if ok else "Against trend"
+
+    return ok, {"fast": fast, "slow": slow, "label": label}
+
+def momentum_acceleration(direction, closes, ema_fast_now, ema_slow_now, rsi_now):
+    if ACCEL_ENABLED != "1":
+        return 0.0, "OFF"
+
+    if len(closes) < 12:
+        return 0.0, "No data"
+
+    # returns
+    r1 = (closes[-1] - closes[-2]) / closes[-2]
+    r2 = (closes[-2] - closes[-3]) / closes[-3]
+    r3 = (closes[-3] - closes[-4]) / closes[-4]
+
+    recent_mean = (r1 + r2 + r3) / 3.0
+    older_mean = (
+        ((closes[-4] - closes[-5]) / closes[-5]) +
+        ((closes[-5] - closes[-6]) / closes[-6]) +
+        ((closes[-6] - closes[-7]) / closes[-7])
+    ) / 3.0
+
+    accel_raw = recent_mean - older_mean
+
+    # RSI slope
+    rsi_old = rsi(closes[:-3], RSI_PERIOD)
+    rsi_delta = 0.0 if rsi_old is None else (rsi_now - rsi_old)
+
+    # ema spread
+    spread_pct = abs(ema_fast_now - ema_slow_now) / closes[-1] * 100
+
+    score = 0.0
+
+    if direction == "BUY":
+        if accel_raw > 0:
+            score += 0.25
+        if recent_mean > 0:
+            score += 0.20
+        if rsi_delta > 1.5:
+            score += 0.20
+    else:
+        if accel_raw < 0:
+            score += 0.25
+        if recent_mean < 0:
+            score += 0.20
+        if rsi_delta < -1.5:
+            score += 0.20
+
+    if spread_pct >= 0.08:
+        score += 0.15
+    if spread_pct >= 0.15:
+        score += 0.10
+
+    score = clamp(score, 0.0, 1.0)
+
+    if score >= 0.80:
+        label = "Very Strong"
+    elif score >= 0.60:
+        label = "Strong"
+    elif score >= 0.40:
+        label = "Building"
+    else:
+        label = "Weak"
+
+    return score, label
 
 # =============================
-# EARLY SETUP + STRONG MOMENTUM
+# EARLY / STRONG
 # =============================
 def early_setup_signal(closes, vols):
-    """
-    تنبيه مبكر قبل الإشارة النهائية.
-    لا يعني دخول، فقط Prepare.
-    """
+    if EARLY_SETUP_ENABLED != "1":
+        return None
+
     if len(closes) < max(EMA_SLOW + 10, RSI_PERIOD + 10, SIGNAL_WINDOW_MIN + 5):
         return None
 
@@ -387,7 +538,6 @@ def early_setup_signal(closes, vols):
     near_high = last >= recent_high * 0.9992
     near_low = last <= recent_low * 1.0008
 
-    # BUY early
     if (
         ema_fast > ema_slow
         and 52 <= r <= 68
@@ -404,7 +554,6 @@ def early_setup_signal(closes, vols):
             "reason": "RSI rising + volume building + near breakout"
         }
 
-    # SELL early
     if (
         ema_fast < ema_slow
         and 32 <= r <= 48
@@ -424,9 +573,6 @@ def early_setup_signal(closes, vols):
     return None
 
 def strong_momentum_label(direction, info, confidence):
-    """
-    إشارة ذهبية نادرة
-    """
     if direction == "BUY":
         if (
             confidence >= STRONG_MOMENTUM_MIN_CONF
@@ -435,6 +581,7 @@ def strong_momentum_label(direction, info, confidence):
             and info["candle_strength_score"] >= 80
             and info["atr_pct"] >= 0.15
             and info["rsi"] < 78
+            and info["accel_score"] >= 0.70
         ):
             return True
     else:
@@ -445,6 +592,7 @@ def strong_momentum_label(direction, info, confidence):
             and info["candle_strength_score"] >= 80
             and info["atr_pct"] >= 0.15
             and info["rsi"] > 22
+            and info["accel_score"] >= 0.70
         ):
             return True
     return False
@@ -452,7 +600,94 @@ def strong_momentum_label(direction, info, confidence):
 # =============================
 # DECISION ENGINE
 # =============================
-def decision_signal(opens, highs, lows, closes, vols):
+def compute_confidence_and_risk(direction: str, info: dict):
+    score = 0.0
+
+    spread_pct = abs(info["ema_fast"] - info["ema_slow"]) / info["price"] * 100
+    score += clamp(spread_pct / 0.15 * 13, 0, 13)
+
+    r = info["rsi"]
+    if direction == "BUY":
+        score += clamp((r - 50) / 20 * 12, 0, 12)
+    else:
+        score += clamp((50 - r) / 20 * 12, 0, 12)
+
+    move = abs(info["move_pct"])
+    score += clamp((move - MIN_MOVE_PCT) / MIN_MOVE_PCT * 12, 0, 12)
+
+    score += clamp((info["vol_ratio"] / VOL_SPIKE) * 12, 0, 12)
+
+    if info["break_up"] or info["break_down"]:
+        score += 8
+
+    score += clamp(info["candle_strength_score"] / 100 * 10, 0, 10)
+
+    if MIN_ATR_PCT <= info["atr_pct"] <= MAX_ATR_PCT:
+        score += 8
+
+    # New additions
+    if info["trend_ok"]:
+        score += 8
+
+    if direction == "BUY" and info["orderbook_imbalance"] >= ORDERBOOK_IMBALANCE_MIN:
+        score += 6
+    elif direction == "SELL" and info["orderbook_imbalance"] <= -ORDERBOOK_IMBALANCE_MIN:
+        score += 6
+
+    if info["sweep_ok"]:
+        score += 5
+
+    score += clamp(info["accel_score"] * 12, 0, 12)
+
+    confidence = 55 + (score / 100.0) * 37
+    confidence = clamp(confidence, 55, 95)
+
+    if confidence >= 82:
+        risk_level = "LOW 🟢"
+        suggested_risk = 1.5
+    elif confidence >= 72:
+        risk_level = "MEDIUM 🟡"
+        suggested_risk = 1.0
+    else:
+        risk_level = "HIGH 🔴"
+        suggested_risk = 0.5
+
+    return int(round(confidence)), risk_level, suggested_risk
+
+def entry_timing_label(direction, info):
+    if info["wick_rejection"]:
+        return "SKIP", "Wick rejection"
+
+    if not info["trend_ok"]:
+        return "SKIP", "Against 1H trend"
+
+    if info["atr_pct"] < MIN_ATR_PCT:
+        return "SKIP", "Low volatility"
+
+    if info["atr_pct"] > MAX_ATR_PCT:
+        return "WAIT 1 CANDLE", "ATR too hot"
+
+    if direction == "BUY":
+        if info["rsi"] >= 75:
+            return "WAIT 1 CANDLE", "RSI high"
+        if info["orderbook_imbalance"] < 0:
+            return "WAIT 1 CANDLE", "Orderbook not supportive"
+        if info["accel_score"] >= 0.70 and info["candle_strength_score"] >= 75:
+            return "ENTER NOW", "Acceleration + strong candle"
+        return "WAIT 1 CANDLE", "Need extra confirmation"
+
+    if direction == "SELL":
+        if info["rsi"] <= 25:
+            return "WAIT 1 CANDLE", "RSI too low"
+        if info["orderbook_imbalance"] > 0:
+            return "WAIT 1 CANDLE", "Orderbook not supportive"
+        if info["accel_score"] >= 0.70 and info["candle_strength_score"] >= 75:
+            return "ENTER NOW", "Acceleration + strong candle"
+        return "WAIT 1 CANDLE", "Need extra confirmation"
+
+    return "SKIP", "No valid direction"
+
+def decision_signal(opens, highs, lows, closes, vols, closes_1h, orderbook_imbalance, orderbook_label):
     n = SIGNAL_WINDOW_MIN
 
     if len(closes) < max(EMA_SLOW + 10, RSI_PERIOD + 10, ATR_PERIOD + 5, n + 5):
@@ -462,9 +697,9 @@ def decision_signal(opens, highs, lows, closes, vols):
     first = closes[-(n + 1)]
     move_pct = ((last - first) / first) * 100
 
-    ema_fast = ema(closes[-(EMA_FAST * 3):], EMA_FAST)
-    ema_slow = ema(closes[-(EMA_SLOW * 3):], EMA_SLOW)
-    if ema_fast is None or ema_slow is None:
+    ema_fast_now = ema(closes[-(EMA_FAST * 3):], EMA_FAST)
+    ema_slow_now = ema(closes[-(EMA_SLOW * 3):], EMA_SLOW)
+    if ema_fast_now is None or ema_slow_now is None:
         return None, None
 
     r = rsi(closes, RSI_PERIOD)
@@ -483,8 +718,8 @@ def decision_signal(opens, highs, lows, closes, vols):
     break_up = last > recent_high
     break_down = last < recent_low
 
-    trend_up = ema_fast > ema_slow
-    trend_down = ema_fast < ema_slow
+    trend_up = ema_fast_now > ema_slow_now
+    trend_down = ema_fast_now < ema_slow_now
 
     atr_val = atr(highs, lows, closes, ATR_PERIOD)
     if atr_val is None:
@@ -521,16 +756,25 @@ def decision_signal(opens, highs, lows, closes, vols):
     candle_score = 0
     candle_label = "Weak"
     wick_flag = False
+    trend_ok = False
+    trend_info = {"fast": 0.0, "slow": 0.0, "label": "OFF"}
+    accel_score = 0.0
+    accel_label = "OFF"
+    sweep_ok = False
+    sweep_reason = "OFF"
 
     if direction:
         candle_score, candle_label = candle_strength(direction, latest_o, latest_h, latest_l, latest_c)
         wick_flag = wick_rejection(direction, latest_o, latest_h, latest_l, latest_c)
+        trend_ok, trend_info = trend_filter_1h(direction, closes_1h)
+        accel_score, accel_label = momentum_acceleration(direction, closes, ema_fast_now, ema_slow_now, r)
+        sweep_ok, sweep_reason = liquidity_sweep_signal(direction, highs, lows, closes)
 
     info = {
         "price": last,
         "move_pct": move_pct,
-        "ema_fast": ema_fast,
-        "ema_slow": ema_slow,
+        "ema_fast": ema_fast_now,
+        "ema_slow": ema_slow_now,
         "rsi": r,
         "vol_ratio": vol_ratio,
         "break_up": break_up,
@@ -539,6 +783,16 @@ def decision_signal(opens, highs, lows, closes, vols):
         "candle_strength_score": candle_score,
         "candle_strength_label": candle_label,
         "wick_rejection": wick_flag,
+        "trend_ok": trend_ok,
+        "trend_label": trend_info["label"],
+        "trend_fast_1h": trend_info["fast"],
+        "trend_slow_1h": trend_info["slow"],
+        "orderbook_imbalance": orderbook_imbalance,
+        "orderbook_label": orderbook_label,
+        "accel_score": accel_score,
+        "accel_label": accel_label,
+        "sweep_ok": sweep_ok,
+        "sweep_reason": sweep_reason,
     }
 
     return direction, info
@@ -551,7 +805,7 @@ def main():
         print("Missing BOT_TOKEN or CHAT_ID")
         return
 
-    tg_send("🟣 Poly Decision Bot started ✅ (Early + Strong Momentum)")
+    tg_send("🟣 Poly Decision Bot started ✅ (Trend + OB + Sweep + Accel)")
 
     last_signal_time = 0
     signals_today = 0
@@ -567,38 +821,46 @@ def main():
                 current_day = today
                 signals_today = 0
 
-            opens, highs, lows, closes, vols, last_price = fetch_klines_1m(limit=250)
+            opens, highs, lows, closes, vols, last_price = fetch_1m(limit=250)
             if closes is None:
                 time.sleep(20)
                 continue
 
+            _, _, _, _, closes_1h, _ = fetch_1h(limit=max(TREND_SLOW_1H + 20, 220))
+            if closes_1h is None:
+                time.sleep(20)
+                continue
+
+            orderbook_imbalance, orderbook_label = fetch_orderbook_imbalance()
             is_trap, trap_info = volatility_trap(closes)
 
-            # ===== EARLY SETUP =====
-            if EARLY_SETUP_ENABLED == "1":
-                early = early_setup_signal(closes, vols)
-                if early:
-                    now = time.time()
-                    if (
-                        now - last_early_time >= EARLY_COOLDOWN_SEC
-                        or last_early_side != early["direction"]
-                    ):
-                        tg_send(
-                            f"⚠️ EARLY SETUP\n"
-                            f"Direction Bias: {early['direction']}\n"
-                            f"BTC-USD\n"
-                            f"Price: {early['price']:.2f}\n"
-                            f"Move({SIGNAL_WINDOW_MIN}m): {early['move_pct']:.2f}%\n"
-                            f"RSI: {early['rsi']:.1f}\n"
-                            f"Vol Build: x{early['vol_ratio']:.2f}\n"
-                            f"Action: PREPARE\n"
-                            f"Reason: {early['reason']}"
-                        )
-                        last_early_time = now
-                        last_early_side = early["direction"]
+            # EARLY SETUP
+            early = early_setup_signal(closes, vols)
+            if early:
+                now = time.time()
+                if (
+                    now - last_early_time >= EARLY_COOLDOWN_SEC
+                    or last_early_side != early["direction"]
+                ):
+                    tg_send(
+                        f"⚠️ EARLY SETUP\n"
+                        f"Direction Bias: {early['direction']}\n"
+                        f"BTC-USD\n"
+                        f"Price: {early['price']:.2f}\n"
+                        f"Move({SIGNAL_WINDOW_MIN}m): {early['move_pct']:.2f}%\n"
+                        f"RSI: {early['rsi']:.1f}\n"
+                        f"Vol Build: x{early['vol_ratio']:.2f}\n"
+                        f"Action: PREPARE\n"
+                        f"Reason: {early['reason']}"
+                    )
+                    last_early_time = now
+                    last_early_side = early["direction"]
 
-            # ===== MAIN DECISION =====
-            direction, info = decision_signal(opens, highs, lows, closes, vols)
+            direction, info = decision_signal(
+                opens, highs, lows, closes, vols,
+                closes_1h,
+                orderbook_imbalance, orderbook_label
+            )
 
             if info:
                 print(
@@ -608,12 +870,17 @@ def main():
                     f"atr={info['atr_pct']:.3f}% "
                     f"candle={info['candle_strength_label']} "
                     f"wick={info['wick_rejection']} "
+                    f"trend1h={info['trend_label']} "
+                    f"ob={info['orderbook_imbalance']:.3f} "
+                    f"accel={info['accel_score']:.2f} "
+                    f"sweep={info['sweep_ok']} "
                     f"trap={is_trap} spike={trap_info['spike_pct']:.3f}% avg={trap_info['avg_pct']:.3f}%"
                 )
             else:
                 print(
                     f"[{datetime.now(timezone.utc)}] price={last_price} waiting "
-                    f"trap={is_trap} spike={trap_info['spike_pct']:.3f}% avg={trap_info['avg_pct']:.3f}%"
+                    f"ob={orderbook_imbalance:.3f} trap={is_trap} "
+                    f"spike={trap_info['spike_pct']:.3f}% avg={trap_info['avg_pct']:.3f}%"
                 )
                 time.sleep(SAMPLE_INTERVAL_SEC)
                 continue
@@ -642,7 +909,6 @@ def main():
                 now = time.time()
                 if now - last_signal_time >= COOLDOWN_SEC:
                     emoji = "📈" if direction == "BUY" else "📉"
-
                     header = f"{emoji} {direction} (Decision)"
                     if is_strong:
                         header = f"🚀 STRONG MOMENTUM {direction}"
@@ -659,6 +925,11 @@ def main():
                         f"ATR%: {info['atr_pct']:.2f}%\n"
                         f"Candle Strength: {info['candle_strength_label']} ({info['candle_strength_score']}/100)\n"
                         f"Wick Rejection: {'YES ⚠️' if info['wick_rejection'] else 'NO ✅'}\n"
+                        f"1H Trend: {info['trend_label']}\n"
+                        f"Orderbook: {info['orderbook_label']} ({info['orderbook_imbalance']:.2f})\n"
+                        f"Acceleration: {info['accel_label']} ({info['accel_score']:.2f})\n"
+                        f"Liquidity Sweep: {'YES ✅' if info['sweep_ok'] else 'NO'}\n"
+                        f"Sweep Note: {info['sweep_reason']}\n"
                         f"\n"
                         f"Confidence: {confidence}%\n"
                         f"Risk Level: {risk_level}\n"
