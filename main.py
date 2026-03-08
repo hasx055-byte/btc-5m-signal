@@ -22,26 +22,27 @@ EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 VOL_SPIKE = float(os.getenv("VOL_SPIKE", "1.8"))
 
-# Confidence filter
 MIN_CONF_SEND = int(os.getenv("MIN_CONF_SEND", "75"))
 
-# Volatility Trap
 VOL_TRAP_ENABLED = os.getenv("VOL_TRAP_ENABLED", "1").strip()
 VOL_TRAP_LOOKBACK = int(os.getenv("VOL_TRAP_LOOKBACK", "30"))
 VOL_TRAP_MULT = float(os.getenv("VOL_TRAP_MULT", "3.0"))
 VOL_TRAP_MIN_PCT = float(os.getenv("VOL_TRAP_MIN_PCT", "0.25"))
 
-# ATR filter
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.10"))
 MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.80"))
 
-# optional: force provider
+# NEW: Early setup / Strong momentum
+EARLY_SETUP_ENABLED = os.getenv("EARLY_SETUP_ENABLED", "1").strip()
+EARLY_COOLDOWN_SEC = int(os.getenv("EARLY_COOLDOWN_SEC", "900"))   # 15m
+STRONG_MOMENTUM_MIN_CONF = int(os.getenv("STRONG_MOMENTUM_MIN_CONF", "88"))
+
 DATA_SOURCE = os.getenv("DATA_SOURCE", "AUTO").strip().upper()
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "poly-decision-bot/4.0",
+    "User-Agent": "poly-decision-bot/5.0",
     "Accept": "application/json"
 })
 
@@ -128,8 +129,7 @@ def fetch_coinbase(limit=250):
     r.raise_for_status()
     data = r.json()
     data = data[:limit]
-    data = list(reversed(data))  # oldest -> newest
-    # [time, low, high, open, close, volume]
+    data = list(reversed(data))
     opens = [float(x[3]) for x in data]
     highs = [float(x[2]) for x in data]
     lows = [float(x[1]) for x in data]
@@ -145,7 +145,6 @@ def fetch_kraken(limit=250):
     j = r.json()
     key = next(iter(set(j["result"].keys()) - {"last"}))
     data = j["result"][key][-limit:]
-    # [time, open, high, low, close, vwap, volume, count]
     opens = [float(x[1]) for x in data]
     highs = [float(x[2]) for x in data]
     lows = [float(x[3]) for x in data]
@@ -187,13 +186,12 @@ def candle_strength(direction, o, h, l, c):
     body = abs(c - o)
     body_ratio = body / candle_range
 
-    close_pos = (c - l) / candle_range  # 0..1
+    close_pos = (c - l) / candle_range
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
 
     score = 0
 
-    # body size
     if body_ratio >= 0.70:
         score += 40
     elif body_ratio >= 0.50:
@@ -203,7 +201,6 @@ def candle_strength(direction, o, h, l, c):
     else:
         score += 10
 
-    # close location
     if direction == "BUY":
         if close_pos >= 0.80:
             score += 35
@@ -211,16 +208,13 @@ def candle_strength(direction, o, h, l, c):
             score += 25
         elif close_pos >= 0.50:
             score += 15
-        # lower wick support
         if lower_wick <= candle_range * 0.15:
             score += 15
         elif lower_wick <= candle_range * 0.25:
             score += 10
-        # upper wick penalty
         if upper_wick > candle_range * 0.35:
             score -= 15
     else:
-        # SELL
         if close_pos <= 0.20:
             score += 35
         elif close_pos <= 0.35:
@@ -253,10 +247,8 @@ def wick_rejection(direction, o, h, l, c):
     lower_wick = min(o, c) - l
 
     if direction == "BUY":
-        # wick above too long = rejection from highs
         return upper_wick / candle_range >= 0.45
     else:
-        # wick below too long = rejection from lows
         return lower_wick / candle_range >= 0.45
 
 def volatility_trap(closes):
@@ -313,10 +305,8 @@ def compute_confidence_and_risk(direction: str, info: dict):
     if info["break_up"] or info["break_down"]:
         score += 12
 
-    # candle strength boost
     score += clamp(info["candle_strength_score"] / 100 * 12, 0, 12)
 
-    # ATR quality
     atr_pct_val = info["atr_pct"]
     if MIN_ATR_PCT <= atr_pct_val <= MAX_ATR_PCT:
         score += 10
@@ -337,7 +327,6 @@ def compute_confidence_and_risk(direction: str, info: dict):
     return int(round(confidence)), risk_level, suggested_risk
 
 def entry_timing_label(direction, info):
-    # حالات تخلي الدخول سيء
     if info["wick_rejection"]:
         return "SKIP", "Wick rejection"
 
@@ -362,6 +351,103 @@ def entry_timing_label(direction, info):
         return "WAIT 1 CANDLE", "Need extra confirmation"
 
     return "SKIP", "No valid direction"
+
+# =============================
+# EARLY SETUP + STRONG MOMENTUM
+# =============================
+def early_setup_signal(closes, vols):
+    """
+    تنبيه مبكر قبل الإشارة النهائية.
+    لا يعني دخول، فقط Prepare.
+    """
+    if len(closes) < max(EMA_SLOW + 10, RSI_PERIOD + 10, SIGNAL_WINDOW_MIN + 5):
+        return None
+
+    last = closes[-1]
+    first = closes[-(SIGNAL_WINDOW_MIN + 1)]
+    move_pct = ((last - first) / first) * 100
+
+    ema_fast = ema(closes[-(EMA_FAST * 3):], EMA_FAST)
+    ema_slow = ema(closes[-(EMA_SLOW * 3):], EMA_SLOW)
+    r = rsi(closes, RSI_PERIOD)
+
+    if ema_fast is None or ema_slow is None or r is None:
+        return None
+
+    lookback = 20
+    if len(vols) < lookback + 2:
+        return None
+
+    avg_vol = sum(vols[-lookback:]) / lookback
+    vol_ratio = 1.0 if avg_vol < 0.0001 else (vols[-1] / avg_vol)
+
+    recent_high = max(closes[-(SIGNAL_WINDOW_MIN+1):-1])
+    recent_low = min(closes[-(SIGNAL_WINDOW_MIN+1):-1])
+
+    near_high = last >= recent_high * 0.9992
+    near_low = last <= recent_low * 1.0008
+
+    # BUY early
+    if (
+        ema_fast > ema_slow
+        and 52 <= r <= 68
+        and move_pct >= MIN_MOVE_PCT * 0.55
+        and vol_ratio >= 1.20
+        and near_high
+    ):
+        return {
+            "direction": "BUY",
+            "price": last,
+            "move_pct": move_pct,
+            "rsi": r,
+            "vol_ratio": vol_ratio,
+            "reason": "RSI rising + volume building + near breakout"
+        }
+
+    # SELL early
+    if (
+        ema_fast < ema_slow
+        and 32 <= r <= 48
+        and move_pct <= -(MIN_MOVE_PCT * 0.55)
+        and vol_ratio >= 1.20
+        and near_low
+    ):
+        return {
+            "direction": "SELL",
+            "price": last,
+            "move_pct": move_pct,
+            "rsi": r,
+            "vol_ratio": vol_ratio,
+            "reason": "RSI falling + volume building + near breakdown"
+        }
+
+    return None
+
+def strong_momentum_label(direction, info, confidence):
+    """
+    إشارة ذهبية نادرة
+    """
+    if direction == "BUY":
+        if (
+            confidence >= STRONG_MOMENTUM_MIN_CONF
+            and info["break_up"]
+            and info["vol_ratio"] >= 2.5
+            and info["candle_strength_score"] >= 80
+            and info["atr_pct"] >= 0.15
+            and info["rsi"] < 78
+        ):
+            return True
+    else:
+        if (
+            confidence >= STRONG_MOMENTUM_MIN_CONF
+            and info["break_down"]
+            and info["vol_ratio"] >= 2.5
+            and info["candle_strength_score"] >= 80
+            and info["atr_pct"] >= 0.15
+            and info["rsi"] > 22
+        ):
+            return True
+    return False
 
 # =============================
 # DECISION ENGINE
@@ -427,7 +513,6 @@ def decision_signal(opens, highs, lows, closes, vols):
     elif sell_ok:
         direction = "SELL"
 
-    # candle diagnostics on latest candle
     latest_o = opens[-1]
     latest_h = highs[-1]
     latest_l = lows[-1]
@@ -466,11 +551,14 @@ def main():
         print("Missing BOT_TOKEN or CHAT_ID")
         return
 
-    tg_send("🟣 Poly Decision Bot started ✅ (Candle+ATR+Timing)")
+    tg_send("🟣 Poly Decision Bot started ✅ (Early + Strong Momentum)")
 
     last_signal_time = 0
     signals_today = 0
     current_day = datetime.now(timezone.utc).date()
+
+    last_early_time = 0
+    last_early_side = None
 
     while True:
         try:
@@ -485,6 +573,31 @@ def main():
                 continue
 
             is_trap, trap_info = volatility_trap(closes)
+
+            # ===== EARLY SETUP =====
+            if EARLY_SETUP_ENABLED == "1":
+                early = early_setup_signal(closes, vols)
+                if early:
+                    now = time.time()
+                    if (
+                        now - last_early_time >= EARLY_COOLDOWN_SEC
+                        or last_early_side != early["direction"]
+                    ):
+                        tg_send(
+                            f"⚠️ EARLY SETUP\n"
+                            f"Direction Bias: {early['direction']}\n"
+                            f"BTC-USD\n"
+                            f"Price: {early['price']:.2f}\n"
+                            f"Move({SIGNAL_WINDOW_MIN}m): {early['move_pct']:.2f}%\n"
+                            f"RSI: {early['rsi']:.1f}\n"
+                            f"Vol Build: x{early['vol_ratio']:.2f}\n"
+                            f"Action: PREPARE\n"
+                            f"Reason: {early['reason']}"
+                        )
+                        last_early_time = now
+                        last_early_side = early["direction"]
+
+            # ===== MAIN DECISION =====
             direction, info = decision_signal(opens, highs, lows, closes, vols)
 
             if info:
@@ -512,6 +625,7 @@ def main():
             if direction:
                 confidence, risk_level, suggested_risk = compute_confidence_and_risk(direction, info)
                 timing, timing_reason = entry_timing_label(direction, info)
+                is_strong = strong_momentum_label(direction, info, confidence)
 
                 if confidence < MIN_CONF_SEND:
                     time.sleep(SAMPLE_INTERVAL_SEC)
@@ -528,8 +642,13 @@ def main():
                 now = time.time()
                 if now - last_signal_time >= COOLDOWN_SEC:
                     emoji = "📈" if direction == "BUY" else "📉"
+
+                    header = f"{emoji} {direction} (Decision)"
+                    if is_strong:
+                        header = f"🚀 STRONG MOMENTUM {direction}"
+
                     msg = (
-                        f"{emoji} {direction} (Decision)\n"
+                        f"{header}\n"
                         f"BTC-USD\n"
                         f"Price: {info['price']:.2f}\n"
                         f"Move({SIGNAL_WINDOW_MIN}m): {info['move_pct']:.2f}%\n"
