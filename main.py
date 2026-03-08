@@ -12,32 +12,36 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 SAMPLE_INTERVAL_SEC = int(os.getenv("SAMPLE_INTERVAL_SEC", "60"))
 
 SIGNAL_WINDOW_MIN = int(os.getenv("SIGNAL_WINDOW_MIN", "15"))
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.35"))        # صفقات أقل وأقوى
+MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.35"))
 
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "1800"))          # 30m
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "1800"))
 MAX_SIGNALS_PER_DAY = int(os.getenv("MAX_SIGNALS_PER_DAY", "4"))
 
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-VOL_SPIKE = float(os.getenv("VOL_SPIKE", "1.8"))               # أقوى
+VOL_SPIKE = float(os.getenv("VOL_SPIKE", "1.8"))
 
-# ✅ NEW: Confidence filter (لا نرسل إلا إذا الثقة أعلى من الحد)
+# Confidence filter
 MIN_CONF_SEND = int(os.getenv("MIN_CONF_SEND", "75"))
 
-# ✅ NEW: Volatility Trap Filter (فخ الشمعة/سبايك الأخبار)
-# إذا آخر دقيقة كانت “مجنونة” مقارنة بمتوسط آخر X دقائق، نتجاهل الإشارة
-VOL_TRAP_ENABLED = os.getenv("VOL_TRAP_ENABLED", "1").strip()   # 1=on, 0=off
-VOL_TRAP_LOOKBACK = int(os.getenv("VOL_TRAP_LOOKBACK", "30"))   # متوسط كم دقيقة
-VOL_TRAP_MULT = float(os.getenv("VOL_TRAP_MULT", "3.0"))        # كم مرة أكبر من المتوسط تعتبر فخ
-VOL_TRAP_MIN_PCT = float(os.getenv("VOL_TRAP_MIN_PCT", "0.25")) # أقل سبايك % عشان نعتبره فخ
+# Volatility Trap
+VOL_TRAP_ENABLED = os.getenv("VOL_TRAP_ENABLED", "1").strip()
+VOL_TRAP_LOOKBACK = int(os.getenv("VOL_TRAP_LOOKBACK", "30"))
+VOL_TRAP_MULT = float(os.getenv("VOL_TRAP_MULT", "3.0"))
+VOL_TRAP_MIN_PCT = float(os.getenv("VOL_TRAP_MIN_PCT", "0.25"))
 
-# optional: force provider (BITSTAMP / COINBASE / KRAKEN / AUTO)
+# ATR filter
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.10"))
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.80"))
+
+# optional: force provider
 DATA_SOURCE = os.getenv("DATA_SOURCE", "AUTO").strip().upper()
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "poly-decision-bot/3.1",
+    "User-Agent": "poly-decision-bot/4.0",
     "Accept": "application/json"
 })
 
@@ -50,7 +54,7 @@ def tg_send(text: str):
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        r = session.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=12)
+        r = session.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=15)
         if r.status_code != 200:
             print("Telegram failed:", r.status_code, r.text[:200])
     except Exception as e:
@@ -84,9 +88,25 @@ def rsi(closes, period=14):
     rs = (gains / period) / (losses / period)
     return 100.0 - (100.0 / (1.0 + rs))
 
+def atr(highs, lows, closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(-period, 0):
+        high = highs[i]
+        low = lows[i]
+        prev_close = closes[i - 1]
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
+        trs.append(tr)
+    return sum(trs) / len(trs)
+
 # =============================
-# DATA PROVIDERS (1m candles)
-# returns closes(list), vols(list), last_close(float)
+# DATA PROVIDERS
+# returns opens, highs, lows, closes, vols, last_close
 # =============================
 def fetch_bitstamp(limit=250):
     url = "https://www.bitstamp.net/api/v2/ohlc/btcusd/"
@@ -94,9 +114,12 @@ def fetch_bitstamp(limit=250):
     r = session.get(url, params=params, timeout=12)
     r.raise_for_status()
     data = r.json()["data"]["ohlc"]
+    opens = [float(x["open"]) for x in data]
+    highs = [float(x["high"]) for x in data]
+    lows = [float(x["low"]) for x in data]
     closes = [float(x["close"]) for x in data]
     vols = [float(x["volume"]) for x in data]
-    return closes, vols, closes[-1]
+    return opens, highs, lows, closes, vols, closes[-1]
 
 def fetch_coinbase(limit=250):
     url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
@@ -105,10 +128,14 @@ def fetch_coinbase(limit=250):
     r.raise_for_status()
     data = r.json()
     data = data[:limit]
-    data = list(reversed(data))  # oldest->newest
+    data = list(reversed(data))  # oldest -> newest
+    # [time, low, high, open, close, volume]
+    opens = [float(x[3]) for x in data]
+    highs = [float(x[2]) for x in data]
+    lows = [float(x[1]) for x in data]
     closes = [float(x[4]) for x in data]
     vols = [float(x[5]) for x in data]
-    return closes, vols, closes[-1]
+    return opens, highs, lows, closes, vols, closes[-1]
 
 def fetch_kraken(limit=250):
     url = "https://api.kraken.com/0/public/OHLC"
@@ -117,11 +144,14 @@ def fetch_kraken(limit=250):
     r.raise_for_status()
     j = r.json()
     key = next(iter(set(j["result"].keys()) - {"last"}))
-    data = j["result"][key]
-    data = data[-limit:]
+    data = j["result"][key][-limit:]
+    # [time, open, high, low, close, vwap, volume, count]
+    opens = [float(x[1]) for x in data]
+    highs = [float(x[2]) for x in data]
+    lows = [float(x[3]) for x in data]
     closes = [float(x[4]) for x in data]
     vols = [float(x[6]) for x in data]
-    return closes, vols, closes[-1]
+    return opens, highs, lows, closes, vols, closes[-1]
 
 def fetch_klines_1m(limit=250):
     if DATA_SOURCE == "BITSTAMP":
@@ -136,74 +166,100 @@ def fetch_klines_1m(limit=250):
     last_err = None
     for fn in providers:
         try:
-            closes, vols, last = fn(limit=limit)
+            opens, highs, lows, closes, vols, last = fn(limit=limit)
             if closes and len(closes) >= 60:
-                return closes, vols, last
+                return opens, highs, lows, closes, vols, last
         except Exception as e:
             last_err = e
             print(f"{fn.__name__} error:", e)
 
     print("All providers failed:", last_err)
-    return None, None, None
+    return None, None, None, None, None, None
 
 # =============================
-# CONFIDENCE + RISK
+# HELPERS
 # =============================
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
-def compute_confidence_and_risk(direction: str, info: dict):
-    score = 0.0  # 0..100
+def candle_strength(direction, o, h, l, c):
+    candle_range = max(h - l, 1e-9)
+    body = abs(c - o)
+    body_ratio = body / candle_range
 
-    # Trend strength (EMA spread)
-    spread_pct = abs(info["ema_fast"] - info["ema_slow"]) / info["price"] * 100
-    score += clamp(spread_pct / 0.15 * 18, 0, 18)  # 0..18
+    close_pos = (c - l) / candle_range  # 0..1
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
 
-    # Momentum (RSI)
-    r = info["rsi"]
+    score = 0
+
+    # body size
+    if body_ratio >= 0.70:
+        score += 40
+    elif body_ratio >= 0.50:
+        score += 30
+    elif body_ratio >= 0.30:
+        score += 20
+    else:
+        score += 10
+
+    # close location
     if direction == "BUY":
-        score += clamp((r - 50) / 20 * 22, 0, 22)  # 0..22
+        if close_pos >= 0.80:
+            score += 35
+        elif close_pos >= 0.65:
+            score += 25
+        elif close_pos >= 0.50:
+            score += 15
+        # lower wick support
+        if lower_wick <= candle_range * 0.15:
+            score += 15
+        elif lower_wick <= candle_range * 0.25:
+            score += 10
+        # upper wick penalty
+        if upper_wick > candle_range * 0.35:
+            score -= 15
     else:
-        score += clamp((50 - r) / 20 * 22, 0, 22)  # 0..22
+        # SELL
+        if close_pos <= 0.20:
+            score += 35
+        elif close_pos <= 0.35:
+            score += 25
+        elif close_pos <= 0.50:
+            score += 15
+        if upper_wick <= candle_range * 0.15:
+            score += 15
+        elif upper_wick <= candle_range * 0.25:
+            score += 10
+        if lower_wick > candle_range * 0.35:
+            score -= 15
 
-    # Move magnitude vs threshold
-    move = abs(info["move_pct"])
-    score += clamp((move - MIN_MOVE_PCT) / (MIN_MOVE_PCT) * 20, 0, 20)  # 0..20
+    score = clamp(score, 0, 100)
 
-    # Volume spike
-    volx = info["vol_ratio"]
-    score += clamp((volx / VOL_SPIKE) * 22, 0, 22)  # 0..22
-
-    # Breakout confirmation
-    if info["break_up"] or info["break_down"]:
-        score += 18  # 0 or 18
-
-    confidence = 55 + (score / 100.0) * 37  # 55..92
-    confidence = clamp(confidence, 55, 92)
-
-    if confidence >= 80:
-        risk_level = "LOW 🟢"
-        suggested_risk = 1.5
-    elif confidence >= 70:
-        risk_level = "MEDIUM 🟡"
-        suggested_risk = 1.0
+    if score >= 80:
+        label = "Very Strong"
+    elif score >= 65:
+        label = "Strong"
+    elif score >= 50:
+        label = "Medium"
     else:
-        risk_level = "HIGH 🔴"
-        suggested_risk = 0.5
+        label = "Weak"
 
-    return int(round(confidence)), risk_level, suggested_risk
+    return int(score), label
 
-# =============================
-# NEW: VOLATILITY TRAP FILTER
-# =============================
+def wick_rejection(direction, o, h, l, c):
+    candle_range = max(h - l, 1e-9)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    if direction == "BUY":
+        # wick above too long = rejection from highs
+        return upper_wick / candle_range >= 0.45
+    else:
+        # wick below too long = rejection from lows
+        return lower_wick / candle_range >= 0.45
+
 def volatility_trap(closes):
-    """
-    يعتمد على عوائد دقيقة واحدة:
-    - spike_pct = |آخر تغير 1m|
-    - avg_pct = متوسط |التغير| خلال lookback
-    يعتبر فخ إذا spike_pct >= VOL_TRAP_MIN_PCT
-    و spike_pct >= VOL_TRAP_MULT * avg_pct
-    """
     if VOL_TRAP_ENABLED != "1":
         return False, {"spike_pct": 0.0, "avg_pct": 0.0}
 
@@ -218,12 +274,10 @@ def volatility_trap(closes):
 
     spike_pct = abs((last - prev) / prev) * 100
 
-    # متوسط تغيرات آخر lb دقائق (absolute returns)
     abs_rets = []
-    start = -(lb + 1)
-    for i in range(start, -1):
-        p0 = closes[i - 1]
-        p1 = closes[i]
+    for i in range(-(lb + 1), -1):
+        p0 = closes[i]
+        p1 = closes[i + 1]
         if p0 <= 0:
             continue
         abs_rets.append(abs((p1 - p0) / p0) * 100)
@@ -232,21 +286,90 @@ def volatility_trap(closes):
         return False, {"spike_pct": spike_pct, "avg_pct": 0.0}
 
     avg_pct = sum(abs_rets) / len(abs_rets)
-
-    # حماية من avg = 0
     if avg_pct < 0.0001:
         return False, {"spike_pct": spike_pct, "avg_pct": avg_pct}
 
     is_trap = (spike_pct >= VOL_TRAP_MIN_PCT) and (spike_pct >= VOL_TRAP_MULT * avg_pct)
     return is_trap, {"spike_pct": spike_pct, "avg_pct": avg_pct}
 
+def compute_confidence_and_risk(direction: str, info: dict):
+    score = 0.0
+
+    spread_pct = abs(info["ema_fast"] - info["ema_slow"]) / info["price"] * 100
+    score += clamp(spread_pct / 0.15 * 16, 0, 16)
+
+    r = info["rsi"]
+    if direction == "BUY":
+        score += clamp((r - 50) / 20 * 18, 0, 18)
+    else:
+        score += clamp((50 - r) / 20 * 18, 0, 18)
+
+    move = abs(info["move_pct"])
+    score += clamp((move - MIN_MOVE_PCT) / MIN_MOVE_PCT * 16, 0, 16)
+
+    volx = info["vol_ratio"]
+    score += clamp((volx / VOL_SPIKE) * 18, 0, 18)
+
+    if info["break_up"] or info["break_down"]:
+        score += 12
+
+    # candle strength boost
+    score += clamp(info["candle_strength_score"] / 100 * 12, 0, 12)
+
+    # ATR quality
+    atr_pct_val = info["atr_pct"]
+    if MIN_ATR_PCT <= atr_pct_val <= MAX_ATR_PCT:
+        score += 10
+
+    confidence = 55 + (score / 100.0) * 37
+    confidence = clamp(confidence, 55, 92)
+
+    if confidence >= 80:
+        risk_level = "LOW 🟢"
+        suggested_risk = 1.5
+    elif confidence >= 70:
+        risk_level = "MEDIUM 🟡"
+        suggested_risk = 1.0
+    else:
+        risk_level = "HIGH 🔴"
+        suggested_risk = 0.5
+
+    return int(round(confidence)), risk_level, suggested_risk
+
+def entry_timing_label(direction, info):
+    # حالات تخلي الدخول سيء
+    if info["wick_rejection"]:
+        return "SKIP", "Wick rejection"
+
+    if info["atr_pct"] < MIN_ATR_PCT:
+        return "SKIP", "Low volatility"
+
+    if info["atr_pct"] > MAX_ATR_PCT:
+        return "WAIT 1 CANDLE", "ATR too hot"
+
+    if direction == "BUY":
+        if info["rsi"] >= 75:
+            return "WAIT 1 CANDLE", "RSI high"
+        if info["candle_strength_score"] >= 75 and info["vol_ratio"] >= 2.0:
+            return "ENTER NOW", "Strong bullish candle"
+        return "WAIT 1 CANDLE", "Need extra confirmation"
+
+    if direction == "SELL":
+        if info["rsi"] <= 25:
+            return "WAIT 1 CANDLE", "RSI too low"
+        if info["candle_strength_score"] >= 75 and info["vol_ratio"] >= 2.0:
+            return "ENTER NOW", "Strong bearish candle"
+        return "WAIT 1 CANDLE", "Need extra confirmation"
+
+    return "SKIP", "No valid direction"
+
 # =============================
 # DECISION ENGINE
 # =============================
-def decision_signal(closes, vols):
+def decision_signal(opens, highs, lows, closes, vols):
     n = SIGNAL_WINDOW_MIN
 
-    if len(closes) < max(EMA_SLOW + 10, RSI_PERIOD + 10, n + 5):
+    if len(closes) < max(EMA_SLOW + 10, RSI_PERIOD + 10, ATR_PERIOD + 5, n + 5):
         return None, None
 
     last = closes[-1]
@@ -262,21 +385,25 @@ def decision_signal(closes, vols):
     if r is None:
         return None, None
 
-    # Volume spike (مع معالجة vol=0)
     lookback = 30
     if len(vols) < lookback + 2:
         return None, None
     avg_vol = sum(vols[-lookback:]) / lookback
     vol_ratio = 1.0 if avg_vol < 0.0001 else (vols[-1] / avg_vol)
 
-    # Breakout filter
-    recent_high = max(closes[-(n+1):-1])
-    recent_low = min(closes[-(n+1):-1])
+    recent_high = max(highs[-(n+1):-1])
+    recent_low = min(lows[-(n+1):-1])
+
     break_up = last > recent_high
     break_down = last < recent_low
 
     trend_up = ema_fast > ema_slow
     trend_down = ema_fast < ema_slow
+
+    atr_val = atr(highs, lows, closes, ATR_PERIOD)
+    if atr_val is None:
+        return None, None
+    atr_pct_val = (atr_val / last) * 100
 
     buy_ok = (
         trend_up and
@@ -294,6 +421,26 @@ def decision_signal(closes, vols):
         break_down
     )
 
+    direction = None
+    if buy_ok:
+        direction = "BUY"
+    elif sell_ok:
+        direction = "SELL"
+
+    # candle diagnostics on latest candle
+    latest_o = opens[-1]
+    latest_h = highs[-1]
+    latest_l = lows[-1]
+    latest_c = closes[-1]
+
+    candle_score = 0
+    candle_label = "Weak"
+    wick_flag = False
+
+    if direction:
+        candle_score, candle_label = candle_strength(direction, latest_o, latest_h, latest_l, latest_c)
+        wick_flag = wick_rejection(direction, latest_o, latest_h, latest_l, latest_c)
+
     info = {
         "price": last,
         "move_pct": move_pct,
@@ -302,14 +449,14 @@ def decision_signal(closes, vols):
         "rsi": r,
         "vol_ratio": vol_ratio,
         "break_up": break_up,
-        "break_down": break_down
+        "break_down": break_down,
+        "atr_pct": atr_pct_val,
+        "candle_strength_score": candle_score,
+        "candle_strength_label": candle_label,
+        "wick_rejection": wick_flag,
     }
 
-    if buy_ok:
-        return "BUY", info
-    if sell_ok:
-        return "SELL", info
-    return None, info
+    return direction, info
 
 # =============================
 # MAIN LOOP
@@ -319,7 +466,7 @@ def main():
         print("Missing BOT_TOKEN or CHAT_ID")
         return
 
-    tg_send("🟣 Poly Decision Bot started ✅ (Confidence>=75 + VolTrap)")
+    tg_send("🟣 Poly Decision Bot started ✅ (Candle+ATR+Timing)")
 
     last_signal_time = 0
     signals_today = 0
@@ -327,28 +474,27 @@ def main():
 
     while True:
         try:
-            # reset daily counter
             today = datetime.now(timezone.utc).date()
             if today != current_day:
                 current_day = today
                 signals_today = 0
 
-            closes, vols, last_price = fetch_klines_1m(limit=250)
+            opens, highs, lows, closes, vols, last_price = fetch_klines_1m(limit=250)
             if closes is None:
                 time.sleep(20)
                 continue
 
-            # Volatility trap check (قبل الإشارة)
             is_trap, trap_info = volatility_trap(closes)
+            direction, info = decision_signal(opens, highs, lows, closes, vols)
 
-            direction, info = decision_signal(closes, vols)
-
-            # logs
             if info:
                 print(
                     f"[{datetime.now(timezone.utc)}] price={last_price} "
                     f"move{SIGNAL_WINDOW_MIN}m={info['move_pct']:.3f}% "
                     f"rsi={info['rsi']:.1f} volx={info['vol_ratio']:.2f} "
+                    f"atr={info['atr_pct']:.3f}% "
+                    f"candle={info['candle_strength_label']} "
+                    f"wick={info['wick_rejection']} "
                     f"trap={is_trap} spike={trap_info['spike_pct']:.3f}% avg={trap_info['avg_pct']:.3f}%"
                 )
             else:
@@ -359,32 +505,28 @@ def main():
                 time.sleep(SAMPLE_INTERVAL_SEC)
                 continue
 
-            now = time.time()
-
-            # لو وصلنا حد الصفقات ما نرسل
             if signals_today >= MAX_SIGNALS_PER_DAY:
                 time.sleep(SAMPLE_INTERVAL_SEC)
                 continue
 
-            # إذا فيه إشارة، نحسب confidence
             if direction:
                 confidence, risk_level, suggested_risk = compute_confidence_and_risk(direction, info)
+                timing, timing_reason = entry_timing_label(direction, info)
 
-                # ✅ NEW: Confidence filter
                 if confidence < MIN_CONF_SEND:
-                    # ما نرسل (فرصة متوسطة/ضعيفة)
                     time.sleep(SAMPLE_INTERVAL_SEC)
                     continue
 
-                # ✅ NEW: Volatility trap filter
                 if is_trap:
-                    # تجاهل الإشارة لأن فيه spike غير طبيعي
-                    # (نقدر نرسل تحذير لو تبغى، حالياً نخليه صامت عشان ما يزعج)
                     time.sleep(SAMPLE_INTERVAL_SEC)
                     continue
 
-                # cooldown + send
-                if (now - last_signal_time >= COOLDOWN_SEC):
+                if timing == "SKIP":
+                    time.sleep(SAMPLE_INTERVAL_SEC)
+                    continue
+
+                now = time.time()
+                if now - last_signal_time >= COOLDOWN_SEC:
                     emoji = "📈" if direction == "BUY" else "📉"
                     msg = (
                         f"{emoji} {direction} (Decision)\n"
@@ -395,10 +537,15 @@ def main():
                         f"EMA{EMA_FAST}/{EMA_SLOW}: {info['ema_fast']:.2f} / {info['ema_slow']:.2f}\n"
                         f"Vol Spike: x{info['vol_ratio']:.2f}\n"
                         f"Breakout: {'UP ✅' if info['break_up'] else ('DOWN ✅' if info['break_down'] else 'NO')}\n"
+                        f"ATR%: {info['atr_pct']:.2f}%\n"
+                        f"Candle Strength: {info['candle_strength_label']} ({info['candle_strength_score']}/100)\n"
+                        f"Wick Rejection: {'YES ⚠️' if info['wick_rejection'] else 'NO ✅'}\n"
                         f"\n"
                         f"Confidence: {confidence}%\n"
                         f"Risk Level: {risk_level}\n"
                         f"Suggested Risk: {suggested_risk}%\n"
+                        f"Timing: {timing}\n"
+                        f"Reason: {timing_reason}\n"
                         f"\n"
                         f"Signals today: {signals_today+1}/{MAX_SIGNALS_PER_DAY}"
                     )
