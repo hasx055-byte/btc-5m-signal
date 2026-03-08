@@ -37,21 +37,21 @@ EARLY_SETUP_ENABLED = os.getenv("EARLY_SETUP_ENABLED", "1").strip()
 EARLY_COOLDOWN_SEC = int(os.getenv("EARLY_COOLDOWN_SEC", "900"))
 STRONG_MOMENTUM_MIN_CONF = int(os.getenv("STRONG_MOMENTUM_MIN_CONF", "88"))
 
-# NEW: Trend Filter (1H)
+# Trend Filter (1H)
 TREND_FILTER_ENABLED = os.getenv("TREND_FILTER_ENABLED", "1").strip()
 TREND_FAST_1H = int(os.getenv("TREND_FAST_1H", "50"))
 TREND_SLOW_1H = int(os.getenv("TREND_SLOW_1H", "200"))
 
-# NEW: Momentum Acceleration
+# Momentum Acceleration
 ACCEL_ENABLED = os.getenv("ACCEL_ENABLED", "1").strip()
 ACCEL_MIN_SCORE = float(os.getenv("ACCEL_MIN_SCORE", "0.55"))
 
-# NEW: Orderbook
+# Orderbook
 ORDERBOOK_ENABLED = os.getenv("ORDERBOOK_ENABLED", "1").strip()
 ORDERBOOK_IMBALANCE_MIN = float(os.getenv("ORDERBOOK_IMBALANCE_MIN", "0.08"))
 ORDERBOOK_LEVELS = int(os.getenv("ORDERBOOK_LEVELS", "20"))
 
-# NEW: Liquidity Sweep
+# Liquidity Sweep
 SWEEP_ENABLED = os.getenv("SWEEP_ENABLED", "1").strip()
 SWEEP_LOOKBACK = int(os.getenv("SWEEP_LOOKBACK", "20"))
 
@@ -59,7 +59,7 @@ DATA_SOURCE = os.getenv("DATA_SOURCE", "AUTO").strip().upper()
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "poly-decision-bot/6.0",
+    "User-Agent": "poly-decision-bot/6.1",
     "Accept": "application/json"
 })
 
@@ -404,19 +404,16 @@ def liquidity_sweep_signal(direction, highs, lows, closes):
     recent_high = max(highs[-(lb+3):-3])
     recent_low = min(lows[-(lb+3):-3])
 
-    # نفحص آخر 3 شموع فقط
     last_close = closes[-1]
     last_high = highs[-1]
     last_low = lows[-1]
 
     if direction == "BUY":
-        # sweep downside then reclaim
         if last_low < recent_low and last_close > recent_low:
             return True, "Downside liquidity sweep reclaimed"
         return False, "No bullish sweep"
 
     if direction == "SELL":
-        # sweep upside then reject
         if last_high > recent_high and last_close < recent_high:
             return True, "Upside liquidity sweep rejected"
         return False, "No bearish sweep"
@@ -448,7 +445,6 @@ def momentum_acceleration(direction, closes, ema_fast_now, ema_slow_now, rsi_now
     if len(closes) < 12:
         return 0.0, "No data"
 
-    # returns
     r1 = (closes[-1] - closes[-2]) / closes[-2]
     r2 = (closes[-2] - closes[-3]) / closes[-3]
     r3 = (closes[-3] - closes[-4]) / closes[-4]
@@ -462,11 +458,9 @@ def momentum_acceleration(direction, closes, ema_fast_now, ema_slow_now, rsi_now
 
     accel_raw = recent_mean - older_mean
 
-    # RSI slope
     rsi_old = rsi(closes[:-3], RSI_PERIOD)
     rsi_delta = 0.0 if rsi_old is None else (rsi_now - rsi_old)
 
-    # ema spread
     spread_pct = abs(ema_fast_now - ema_slow_now) / closes[-1] * 100
 
     score = 0.0
@@ -625,7 +619,6 @@ def compute_confidence_and_risk(direction: str, info: dict):
     if MIN_ATR_PCT <= info["atr_pct"] <= MAX_ATR_PCT:
         score += 8
 
-    # New additions
     if info["trend_ok"]:
         score += 8
 
@@ -672,6 +665,8 @@ def entry_timing_label(direction, info):
             return "WAIT 1 CANDLE", "RSI high"
         if info["orderbook_imbalance"] < 0:
             return "WAIT 1 CANDLE", "Orderbook not supportive"
+        if info["accel_score"] < ACCEL_MIN_SCORE:
+            return "WAIT 1 CANDLE", "Acceleration too weak"
         if info["accel_score"] >= 0.70 and info["candle_strength_score"] >= 75:
             return "ENTER NOW", "Acceleration + strong candle"
         return "WAIT 1 CANDLE", "Need extra confirmation"
@@ -681,6 +676,8 @@ def entry_timing_label(direction, info):
             return "WAIT 1 CANDLE", "RSI too low"
         if info["orderbook_imbalance"] > 0:
             return "WAIT 1 CANDLE", "Orderbook not supportive"
+        if info["accel_score"] < ACCEL_MIN_SCORE:
+            return "WAIT 1 CANDLE", "Acceleration too weak"
         if info["accel_score"] >= 0.70 and info["candle_strength_score"] >= 75:
             return "ENTER NOW", "Acceleration + strong candle"
         return "WAIT 1 CANDLE", "Need extra confirmation"
@@ -826,7 +823,8 @@ def main():
                 time.sleep(20)
                 continue
 
-            _, _, _, _, closes_1h, _ = fetch_1h(limit=max(TREND_SLOW_1H + 20, 220))
+            # ✅ الإصلاح هنا
+            _, _, _, closes_1h, _, _ = fetch_1h(limit=max(TREND_SLOW_1H + 20, 220))
             if closes_1h is None:
                 time.sleep(20)
                 continue
