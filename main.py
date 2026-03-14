@@ -222,14 +222,14 @@ def wick_rejection(direction: str, o: float, h: float, l: float, c: float) -> bo
 # MARKET DATA
 # =========================================================
 
-class BinancePublicData:
-    def __init__(self, base_url: str) -> None:
-        self.base_url = base_url.rstrip("/")
+class MultiSourceData:
+    def __init__(self) -> None:
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "btc-15m-flow-bot/1.0"})
+        self.session.headers.update({"User-Agent": "btc-15m-flow-bot/1.1"})
 
-    def fetch_1m_klines(self, symbol: str, limit: int = 250):
-        url = f"{self.base_url}/api/v3/klines"
+    # ---------- Binance ----------
+    def fetch_binance_1m_klines(self, symbol: str, limit: int = 250):
+        url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": "1m", "limit": limit}
         r = self.session.get(url, params=params, timeout=15)
         r.raise_for_status()
@@ -240,42 +240,114 @@ class BinancePublicData:
         lows = [float(x[3]) for x in data]
         closes = [float(x[4]) for x in data]
         vols = [float(x[5]) for x in data]
-        return opens, highs, lows, closes, vols
+        return opens, highs, lows, closes, vols, "BINANCE"
 
-    def fetch_orderbook_pressure(self, symbol: str, levels: int = 20) -> tuple[float, str]:
+    def fetch_binance_orderbook(self, symbol: str, levels: int = 20):
+        url = "https://api.binance.com/api/v3/depth"
+        params = {"symbol": symbol, "limit": levels}
+        r = self.session.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        j = r.json()
+
+        bids = j.get("bids", [])[:levels]
+        asks = j.get("asks", [])[:levels]
+
+        bid_vol = sum(float(qty) for _, qty in bids)
+        ask_vol = sum(float(qty) for _, qty in asks)
+
+        total = bid_vol + ask_vol
+        if total <= 0:
+            return 0.0, "Neutral"
+
+        imbalance = (bid_vol - ask_vol) / total
+        if imbalance > SETTINGS.PRESSURE_MIN:
+            label = "Bullish"
+        elif imbalance < -SETTINGS.PRESSURE_MIN:
+            label = "Bearish"
+        else:
+            label = "Neutral"
+
+        return imbalance, label
+
+    # ---------- Coinbase ----------
+    def fetch_coinbase_1m_klines(self, limit: int = 250):
+        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+        params = {"granularity": 60}
+        r = self.session.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        data = data[:limit]
+        data = list(reversed(data))  # oldest -> newest
+
+        opens = [float(x[3]) for x in data]
+        highs = [float(x[2]) for x in data]
+        lows = [float(x[1]) for x in data]
+        closes = [float(x[4]) for x in data]
+        vols = [float(x[5]) for x in data]
+        return opens, highs, lows, closes, vols, "COINBASE"
+
+    # ---------- Kraken ----------
+    def fetch_kraken_1m_klines(self, limit: int = 250):
+        url = "https://api.kraken.com/0/public/OHLC"
+        params = {"pair": "XBTUSD", "interval": 1}
+        r = self.session.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        j = r.json()
+
+        key = next(iter(set(j["result"].keys()) - {"last"}))
+        data = j["result"][key][-limit:]
+
+        opens = [float(x[1]) for x in data]
+        highs = [float(x[2]) for x in data]
+        lows = [float(x[3]) for x in data]
+        closes = [float(x[4]) for x in data]
+        vols = [float(x[6]) for x in data]
+        return opens, highs, lows, closes, vols, "KRAKEN"
+
+    # ---------- Bitstamp ----------
+    def fetch_bitstamp_1m_klines(self, limit: int = 250):
+        url = "https://www.bitstamp.net/api/v2/ohlc/btcusd/"
+        params = {"step": 60, "limit": limit}
+        r = self.session.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()["data"]["ohlc"]
+
+        opens = [float(x["open"]) for x in data]
+        highs = [float(x["high"]) for x in data]
+        lows = [float(x["low"]) for x in data]
+        closes = [float(x["close"]) for x in data]
+        vols = [float(x["volume"]) for x in data]
+        return opens, highs, lows, closes, vols, "BITSTAMP"
+
+    # ---------- Unified fetch ----------
+    def fetch_1m_klines(self, symbol: str, limit: int = 250):
+        providers = [
+            lambda: self.fetch_binance_1m_klines(symbol, limit),
+            lambda: self.fetch_coinbase_1m_klines(limit),
+            lambda: self.fetch_kraken_1m_klines(limit),
+            lambda: self.fetch_bitstamp_1m_klines(limit),
+        ]
+
+        last_err = None
+        for fn in providers:
+            try:
+                return fn()
+            except Exception as e:
+                last_err = e
+                print("Provider failed:", e)
+
+        raise RuntimeError(f"All market data providers failed: {last_err}")
+
+    def fetch_orderbook_pressure(self, symbol: str, levels: int = 20):
         if not SETTINGS.ORDERBOOK_ENABLED:
             return 0.0, "OFF"
 
-        url = f"{self.base_url}/api/v3/depth"
-        params = {"symbol": symbol, "limit": levels}
         try:
-            r = self.session.get(url, params=params, timeout=15)
-            r.raise_for_status()
-            j = r.json()
-
-            bids = j.get("bids", [])[:levels]
-            asks = j.get("asks", [])[:levels]
-
-            bid_vol = sum(float(qty) for _, qty in bids)
-            ask_vol = sum(float(qty) for _, qty in asks)
-
-            total = bid_vol + ask_vol
-            if total <= 0:
-                return 0.0, "Neutral"
-
-            imbalance = (bid_vol - ask_vol) / total
-            if imbalance > SETTINGS.PRESSURE_MIN:
-                label = "Bullish"
-            elif imbalance < -SETTINGS.PRESSURE_MIN:
-                label = "Bearish"
-            else:
-                label = "Neutral"
-
-            return imbalance, label
+            return self.fetch_binance_orderbook(symbol, levels)
         except Exception as e:
-            print("Orderbook fetch error:", e)
-            return 0.0, "Neutral"
-
+            print("Orderbook disabled/fallback due to error:", e)
+            return 0.0, "OFF"
 
 # =========================================================
 # FLOW FEATURES
@@ -455,7 +527,7 @@ def build_buy_signal(opens, highs, lows, closes, vols, orderbook_imbalance, orde
 
     drift = compute_drift_features(closes)
     volume_info = compute_volume_expansion(vols)
-    accel_score, accel_label = compute_buy_acceleration(closes, ema_fast_now, ema_slow_now, r)
+    accel_score, accel_he label = compute_buy_acceleration(closes, ema_fast_now, ema_slow_now, r)
     reclaim_ok, reclaim_note = retest_reclaim_buy(highs, closes, n)
 
     trend_up = ema_fast_now > ema_slow_now
@@ -800,7 +872,7 @@ def main():
         print("Missing BOT_TOKEN or CHAT_ID")
         return
 
-    data = BinancePublicData(SETTINGS.BINANCE_BASE)
+    data = MultiSourceData()
     tg = TelegramNotifier(SETTINGS.BOT_TOKEN, SETTINGS.CHAT_ID)
 
     tg.send(
@@ -823,7 +895,7 @@ def main():
                 current_day = today
                 signals_today = 0
 
-            opens, highs, lows, closes, vols = data.fetch_1m_klines(SETTINGS.SYMBOL, 250)
+            opens, highs, lows, closes, vols, source_name = data.fetch_1m_klines(SETTINGS.SYMBOL, 250)
             orderbook_imbalance, orderbook_label = data.fetch_orderbook_pressure(SETTINGS.SYMBOL, 20)
 
             early = build_early_signal(opens, highs, lows, closes, vols)
